@@ -68,6 +68,7 @@ train_loader, test_loader = create_gpu_dataloaders(512)
 # ====================================================================
 # 2. Model & Objective Setup (GPU)
 # ====================================================================
+
 model = Chain(
     Dense(784 => 256, relu),
     Dense(256 => 128, relu),
@@ -78,20 +79,18 @@ model = Chain(
 rng = Xoshiro(0)
 ps, st = Lux.setup(rng, model)
 
-# Migrate parameters and states to the GPU
-ps_gpu = ps |> dev
+# Migrate states to VRAM
 st_gpu = st |> dev
 
-# Flatten the VRAM parameters into a ComponentArray for the solver
-ps_cv = ComponentArray(ps_gpu)
+# Flatten parameters into a ComponentArray first, THEN migrate to VRAM
+ps_cv = ComponentArray(ps) |> dev
 
 function lossfn(y_pred, y_true)
     log_probs = NNlib.logsoftmax(y_pred; dims=1)
     return mean(-sum(y_true .* log_probs; dims=1))
 end
 
-# The structural dual caches inside the struct will automatically 
-# pre-allocate on the GPU because `ps_cv` is a CuArray.
+# nlp.meta.x0 will now strictly be a CuArray
 nlp = LuxNLPModel(model, ps_cv, st_gpu, train_loader, lossfn)
 
 # ====================================================================
