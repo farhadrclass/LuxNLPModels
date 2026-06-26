@@ -1,32 +1,37 @@
 import NLPModels: hprod!
 
-function hprod!(nlp::LuxNLPModel{T}, x::AbstractVector{T}, v::AbstractVector{T}, hv::AbstractVector{T}) where T
-    # Define exact Dual layout
-    TagType = typeof(ForwardDiff.Tag(LuxNLPModelTag(), T))
-    DualType = ForwardDiff.Dual{TagType, T, 1}
+"""
+    hprod!(nlp, x, v, hv; obj_weight=1)
 
-    # 1. Mutate cached array with new parameters + directional vector
-    nlp.x_dual_cache .= DualType.(x, ForwardDiff.Partials{1, T}.(tuple.(v)))
-    
-    # 2. View generation
-    cx_dual = ComponentVector(nlp.x_dual_cache, nlp.axes)
-    
-    X_batch, y_batch = nlp.current_batch
+Hessian-vector product via a forward finite-difference of the gradient:
 
-    # 3. Zygote Backward Pass over ForwardDiff Dual Types
-    grads = Zygote.gradient(cx_dual) do p
-        y_pred, _ = nlp.model(X_batch, p, nlp.st)
-        return nlp.loss_fn(y_pred, y_batch)
-    end
+    ∇²f(x) v  ≈  (∇f(x + ε v) − ∇f(x)) / ε,   ε = √eps(T)
 
-    g_dual = first(grads)
-    
-    # 4. Extract Epsilon Partials
-    if isnothing(g_dual)
-        fill!(hv, zero(T))
-    else
-        hv .= ForwardDiff.partials.(getdata(g_dual), 1)
-    end
-    
+This approach is GPU-compatible because it never stores `ForwardDiff.Dual`
+values in device arrays (which is unsupported by CUDA / AMDGPU).
+It calls the internal `_compute_grad!` helper twice to avoid inflating the
+`neval_grad` counter.
+"""
+function hprod!(
+    nlp        :: LuxNLPModel{T},
+    x          :: AbstractVector{T},
+    v          :: AbstractVector{T},
+    hv         :: AbstractVector{T};
+    obj_weight :: T = one(T),
+) where T
+    NLPModels.increment!(nlp, :neval_hprod)
+
+    ε   = sqrt(eps(T))
+    xpv = x .+ ε .* v
+
+    # ∇f(x + ε v) → written into hv
+    _compute_grad!(nlp, xpv, hv)
+    # ∇f(x)       → written into hv_cache
+    _compute_grad!(nlp, x, nlp.hv_cache)
+
+    # Forward finite difference
+    @. hv = (hv - nlp.hv_cache) / ε
+
+    obj_weight != one(T) && (hv .*= obj_weight)
     return hv
 end

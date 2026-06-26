@@ -1,8 +1,0 @@
-[deps]
-CUDA = "052768ef-5323-5732-b1bb-66c8b64840ba"
-ComponentArrays = "b0b7db55-cfe3-40fc-9ded-d10e2dbeff66"
-JSOSolvers = "10dff2fc-5484-5881-a0e0-c90441020f8a"
-Lux = "b2108857-7c20-44ae-9111-449ecde12c47"
-LuxCUDA = "d0bbae9a-e099-4d5b-a835-1c6931763bda"
-LuxNLPModels = "ca706788-1647-49eb-9df0-e37380962391"
-NLPModels = "a4795742-8479-5a88-8948-cc11e1c8c1a6"

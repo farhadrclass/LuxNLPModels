@@ -4,7 +4,6 @@ using NLPModels
 using Lux
 using ComponentArrays
 using Zygote
-import ForwardDiff
 
 export LuxNLPModel, minibatch_next_train!
 

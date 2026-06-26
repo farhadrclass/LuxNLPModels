@@ -1,8 +1,159 @@
-# FluxNLPModels.jl Tutorial
+# LuxNLPModels.jl Tutorial
 
-## Setting up 
-This step-by-step example assumes prior knowledge of [Julia](https://julialang.org/) and [Flux.jl](https://github.com/FluxML/Flux.jl).
-See the [Julia tutorial](https://julialang.org/learning/) and the [Flux.jl tutorial](https://fluxml.ai/Flux.jl/stable/models/quickstart/#man-quickstart) for more details.
+This tutorial assumes basic familiarity with
+[Julia](https://julialang.org/),
+[Lux.jl](https://lux.csail.mit.edu/stable/), and
+[NLPModels.jl](https://juliasmoothoptimizers.github.io/NLPModels.jl/stable/).
+
+We fit a small MLP to noisy quadratic data, then compare three
+JSOSolvers optimisers: plain SGD (via the NLPModels interface), R2, and L-BFGS.
+
+## Packages
+
+```@example tutorial
+using Lux, ComponentArrays, MLUtils
+using NLPModels, JSOSolvers
+using LuxNLPModels
+using Random, Statistics
+```
+
+## Data
+
+We generate 128 samples from $y = x^2 - 2x$ with additive Gaussian noise.
+
+```@example tutorial
+rng = Random.MersenneTwister(42)
+
+x_data = reshape(collect(range(-2f0, 2f0, 128)), 1, 128)
+y_data = evalpoly.(x_data, Ref((0f0, -2f0, 1f0)))
+y_data .+= randn(rng, Float32, size(y_data)) .* 0.1f0
+
+# Full-batch DataLoader (single batch = full-batch gradient descent)
+loader = DataLoader((x_data, y_data); batchsize=128, shuffle=false)
+```
+
+## Model
+
+```@example tutorial
+model = Chain(Dense(1 => 16, relu), Dense(16 => 1))
+ps, st = Lux.setup(rng, model)
+ps_cv  = ComponentArray(ps)   # flat parameter vector with ComponentArray axes
+```
+
+## Loss and NLPModel wrapper
+
+The loss function must have the signature `(ŷ, y) -> scalar`.
+
+```@example tutorial
+loss_fn(ŷ, y) = mean(abs2, ŷ .- y)   # MSE
+
+# Each solver gets a fresh model from the same starting point
+make_nlp() = LuxNLPModel(model, ps_cv, st, loader, loss_fn)
+
+nlp = make_nlp()
+println("Parameters : ", nlp.meta.nvar)
+println("Loss (x₀)  : ", obj(nlp, nlp.meta.x0))
+```
+
+`nlp.meta.x0` is always a plain `Vector{Float32}` on CPU so that JSOSolvers
+can allocate its internal buffers correctly.
+
+## Evaluating gradients
+
+```@example tutorial
+g = similar(nlp.meta.x0)
+grad!(nlp, nlp.meta.x0, g)
+println("‖∇f(x₀)‖ = ", sqrt(sum(abs2, g)))
+```
+
+Use `objgrad!` to compute both in a single AD pass (recommended inside solvers):
+
+```@example tutorial
+f, g = objgrad!(nlp, nlp.meta.x0, g)
+```
+
+## Solving with L-BFGS
+
+```@example tutorial
+lbfgs_hist = Float32[]
+nlp_lbfgs  = make_nlp()
+
+stats = lbfgs(
+    nlp_lbfgs;
+    max_iter = 300,
+    atol     = 1f-6,
+    callback = (nlp, solver, stats) -> push!(lbfgs_hist, stats.objective),
+)
+
+println("Status     : ", stats.status)
+println("Final loss : ", stats.objective)
+println("Iterations : ", stats.iter)
+```
+
+## Solving with R2
+
+```@example tutorial
+r2_hist = Float32[]
+nlp_r2  = make_nlp()
+
+stats_r2 = R2(
+    nlp_r2;
+    max_iter = 800,
+    atol     = 1f-6,
+    rtol     = 0f0,
+    callback = (nlp, solver, stats) -> push!(r2_hist, stats.objective),
+)
+println("R2 final loss : ", stats_r2.objective)
+```
+
+## Mini-batch training
+
+For mini-batch training call `minibatch_next_train!` in the callback to
+advance to the next batch after each solver iteration:
+
+```julia
+loader_mb = DataLoader((x_data, y_data); batchsize=32, shuffle=true)
+nlp_mb    = LuxNLPModel(model, ps_cv, st, loader_mb, loss_fn)
+
+stats = R2(
+    nlp_mb;
+    max_iter = 1000,
+    callback = (nlp, solver, stats) -> minibatch_next_train!(nlp),
+)
+```
+
+## Inference
+
+Reconstruct the optimised `ComponentVector` from the flat solution and run
+the model in test mode:
+
+```@example tutorial
+opt_ps  = ComponentArray(stats.solution, getaxes(ps_cv))
+st_test = Lux.testmode(st)
+y_pred, _ = Lux.apply(model, x_data, opt_ps, st_test)
+println("Prediction range: ", extrema(y_pred))
+```
+
+## GPU usage
+
+Move data and state to the GPU before construction.
+The solver's parameter vector stays on CPU automatically.
+
+```julia
+using LuxCUDA
+dev = gpu_device()
+
+x_gpu  = x_data |> dev
+y_gpu  = y_data |> dev
+st_gpu = st     |> dev
+
+loader_gpu = DataLoader((x_gpu, y_gpu); batchsize=128, shuffle=false)
+
+nlp_gpu = LuxNLPModel(model, ps_cv, st_gpu, loader_gpu, loss_fn; dev)
+
+stats_gpu = lbfgs(nlp_gpu; max_iter=300, atol=1f-6)
+```
+
 
 
 We have aligned this tutorial to [MLP_MNIST](https://github.com/FluxML/model-zoo/blob/master/vision/mlp_mnist/mlp_mnist.jl) example and reused some of their functions.

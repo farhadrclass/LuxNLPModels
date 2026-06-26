@@ -1,30 +1,36 @@
-# FluxNLPModels.jl
+# LuxNLPModels.jl
 
 ## Compatibility
 Julia ≥ 1.9.
 
 ## How to install
 
-This module can be installed with the following command:
 ```julia
-pkg> add FluxNLPModels
+pkg> add LuxNLPModels
 ```
 
 ## Synopsis
 
-FluxNLPModels exposes neural network models as optimization problems conforming to the [NLPModels API](https://github.com/JuliaSmoothOptimizers/NLPModels.jl). FluxNLPModels is an interface between [Flux.jl](https://github.com/FluxML/Flux.jl)'s classification neural networks and [NLPModels.jl](https://github.com/JuliaSmoothOptimizers/NLPModels.jl).
+`LuxNLPModels` exposes [Lux.jl](https://github.com/LuxDL/Lux.jl) neural
+networks as nonlinear optimization problems conforming to the
+[NLPModels API](https://github.com/JuliaSmoothOptimizers/NLPModels.jl).
+This makes it possible to train neural networks with any solver from
+[JSOSolvers.jl](https://github.com/JuliaSmoothOptimizers/JSOSolvers.jl)
+(R2, L-BFGS, trunk, …) without modification.
 
-A `FluxNLPModel` gives the user access to:
-- The values of the neural network variables/weights `w`;
-- The value of the objective/loss function `L(X, Y; w)` at `w` for a given minibatch `(X,Y)`;
-- The gradient `∇L(X, Y; w)` of the objective/loss function at `w` for a given minibatch `(X,Y)`.
+A `LuxNLPModel` exposes:
+- `obj(nlp, x)` — loss evaluated at the flat parameter vector `x`
+- `grad!(nlp, x, g)` — in-place gradient via Zygote
+- `objgrad!(nlp, x, g)` — combined forward+backward pass (half the AD cost)
+- `hprod!(nlp, x, v, hv)` — Hessian-vector product (finite-difference, GPU-safe)
+- `minibatch_next_train!(nlp)` — advance to the next mini-batch
 
-In addition, it provides tools to:
-- Switch the minibatch used to evaluate the neural network;
-- Retrieve the current minibatch ;
-- Measure the neural network's loss at the current `w`.
+Parameters are stored as a flat `Vector{T}` on CPU (JSOSolvers
+compatibility).  GPU execution is supported: pass `dev=gpu_device()` and
+move your data and Lux state to the device — the CPU/GPU transfer is
+handled transparently inside each function call.
 
-# Bug reports and discussions
+## Bug reports
 
-If you encounter any bugs or have suggestions for improvement, please open an [issue](https://github.com/JuliaSmoothOptimizers/FluxNLPModels.jl/issues). For general questions or discussions related to this repository and the [JuliaSmoothOptimizers](https://github.com/JuliaSmoothOptimizers) organization, feel free to start a discussion [here](https://github.com/JuliaSmoothOptimizers/Organization/discussions).
+Please open an [issue](https://github.com/Farhad-Phd/LuxNLPModels.jl/issues).
 

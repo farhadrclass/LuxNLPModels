@@ -82,40 +82,39 @@ ps, st = Lux.setup(rng, model)
 # Migrate states to VRAM
 st_gpu = st |> dev
 
-# Flatten parameters into a ComponentArray first, THEN migrate to VRAM
-ps_cv = ComponentArray(ps) |> dev
+# ComponentArray on CPU first; LuxNLPModel will handle the GPU transfer internally.
+# Do NOT pre-migrate ps_cv to GPU: the constructor copies x0 to CPU regardless,
+# and passing a GPU ComponentVector is fine (Array(getdata(ps)) handles both cases).
+ps_cv = ComponentArray(ps)
 
 function lossfn(y_pred, y_true)
     log_probs = NNlib.logsoftmax(y_pred; dims=1)
     return mean(-sum(y_true .* log_probs; dims=1))
 end
 
-# nlp.meta.x0 will now strictly be a CuArray
-nlp = LuxNLPModel(model, ps_cv, st_gpu, train_loader, lossfn)
+# Pass dev= so that obj/grad!/objgrad! move parameters to the correct device.
+# meta.x0 is always a plain CPU Vector{Float32}.
+nlp = LuxNLPModel(model, ps_cv, st_gpu, train_loader, lossfn; dev)
 
 # ====================================================================
 # 3. Hardware Verification & Derivative Checks
 # ====================================================================
 println("\n--- Hardware & Model Summary ---")
-x0 = nlp.meta.x0
+x0 = nlp.meta.x0   # always a plain CPU Vector{Float32}
 
-# Prove the parameters are in VRAM
-println("Memory Type:  ", typeof(getdata(x0)))
-if typeof(getdata(x0)) <: CuArray
-    println("Status:       SUCCESS (Model is on GPU)")
-else
-    println("Status:       WARNING (Model is on CPU)")
-end
+# x0 is intentionally on CPU; GPU execution is handled inside obj/grad!.
+println("x0 type (solver-side):  ", typeof(x0))
+println("Model device:           ", nlp.dev)
 
-println("\nTesting GPU Derivative Kernels...")
+println("\nTesting Derivative Kernels...")
 println("f(x0):    ", obj(nlp, x0))
 
 g = similar(x0)
 grad!(nlp, x0, g)
 println("|g(x0)|:  ", norm(g))
 
-# Generate a normalized random projection vector directly on the GPU
-v = randn(rng, Float32, length(x0)) |> dev
+# Generate a normalized random projection vector on CPU (solver-side)
+v = randn(rng, Float32, length(x0))
 v ./= norm(v)
 hv = similar(x0)
 hprod!(nlp, x0, v, hv)
