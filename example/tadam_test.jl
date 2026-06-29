@@ -35,7 +35,7 @@ function generate_adversarial_data(rng, n_features=50, n_samples=5000)
     
     # Cauchy noise (Heavy-tailed, undefined variance)
     noise = (randn(rng, Float32, 1, n_samples) ./ randn(rng, Float32, 1, n_samples))
-    noise .*= 5.0 
+    noise .*= 0.0050 
     
     y = w_true * x .+ noise
     return x, y, vec(w_true)

@@ -86,7 +86,7 @@ function run_adam!(nlp; lr::Float32=0.001f0, max_iter::Int=100)
     return x, losses
 end
 
-x_adam, adam_loss = run_adam!(make_nlp(); lr=0.001f0, max_iter=100)
+x_adam, adam_loss = run_adam!(make_nlp(); lr=0.001f0, max_iter=1500)
 
 # -----------------------------------------------------------------------
 # 4. TADAM Benchmark
@@ -101,10 +101,16 @@ end
 @info "Starting TADAM Training..."
 stats_tadam = tadam(
     nlp_tadam;
-    max_iter = 100,
-    atol     = 1f-5,
-    rtol     = 0f0,
+    max_iter = 1500,
+    atol     = 1f-8,
+    rtol     = 1f-8,
+    # atol     = 1f-5,
+    # rtol     = 0f0,
     callback = tadam_callback,
+    η2       = 0.75f0,  # Allows trust-region expansion on rough models
+    γ3       = 0.9f0,   # Prevents over-penalizing momentum on rejected steps
+    β2       = 0.99f0,  # Makes the diagonal Hessian approximation more agile
+    ϵ_v      = 1e-6,  # Float32 stability
     verbose  = 10  # Print every 10 iterations
 )
 
