@@ -91,12 +91,15 @@ x_adam, adam_loss = run_adam!(make_nlp(); lr=0.001f0, max_iter=1500)
 # -----------------------------------------------------------------------
 # 4. TADAM Benchmark
 # -----------------------------------------------------------------------
-tadam_loss = Float32[]
-nlp_tadam  = make_nlp()
+tadam_loss  = Float32[]
+nlp_tadam   = make_nlp()
+_prev_ngrad = Ref(-1)   # sentinel: -1 means "not yet initialised"
 
 function tadam_callback(nlp, solver, stats)
     push!(tadam_loss, stats.objective)
+    solver.step_accepted && minibatch_next_train!(nlp)
 end
+
 
 @info "Starting TADAM Training..."
 stats_tadam = tadam(
