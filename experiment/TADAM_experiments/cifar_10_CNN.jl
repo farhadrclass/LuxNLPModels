@@ -85,7 +85,8 @@ loss_fn(ŷ, y) = mean(-sum(y .* logsoftmax(ŷ; dims=1); dims=1))
 # GPU-accelerated and memory-safe batched evaluation
 function eval_metrics(ps_vec)
     # Keep parameters directly on the GPU! (No Array() copy needed)
-    ps_s = ComponentArray(ps_vec, getaxes(ps_template))
+    # ps_s = ComponentArray(ps_vec, getaxes(ps_template))
+    ps_s = ComponentArray(to_dev(ps_vec), getaxes(ps_template))
     
     function batched_eval(x_data_cpu, y_data_cpu)
         N = size(x_data_cpu, 4)
