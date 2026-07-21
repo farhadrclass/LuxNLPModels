@@ -244,7 +244,8 @@ _, h_tadam   = let
         η2  = 0.90f0,
         # Gentler TR radius updates (prevents 50% ping-ponging)
         γ1  = 0.80f0, 
-        γ2  = 1.20f0, 
+        γ2  = 1.20f0,
+        γ3  = 0.02f0,   # 
         # Adam momentum
         β1  = 0.90f0,
         β2  = 0.99f0,
