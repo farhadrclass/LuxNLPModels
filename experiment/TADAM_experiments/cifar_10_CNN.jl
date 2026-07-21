@@ -269,8 +269,9 @@ _, h_tadam   = let
         η1   = 0.0001f0,      # Deep Learning noise adaptation: allow tiny drops
         η2   = 0.85f0,        # expand TR    if ρ_k ≥ η2
         # ── TR radius update factors ──────────────────────────
-        γ1  = 0.80f0,         # Soften rejection impact (prevents ping-ponging)
-        γ2  = 1.20f0,         # Gentle expansion    on very good step
+        γ1  = 0.80f0,         #
+        γ2  = 1.20f0,         #
+        γ3  = 0.02f0,         #
         # ── Adam momentum parameters ──────────────────────────
         β1   = 0.90f0,        # β_mom
         β2   = 0.99f0,        # β_rms
