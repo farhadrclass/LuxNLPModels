@@ -22,6 +22,7 @@ using OneHotArrays
 using NNlib: logsoftmax
 using Random, Statistics, Printf, LinearAlgebra
 using CairoMakie
+import CairoMakie: Axis
 
 # ----------------------------------------------------------------
 # 0.  GPU / Device
@@ -125,8 +126,7 @@ function snap!(h::Hist, iter, batches, ps_vec, tag)
     tr_loss, tr_acc, te_acc = eval_metrics(ps_vec)
     push!(h.iters, iter);  push!(h.batches, batches); push!(h.times, h._t_accum)
     push!(h.tr_loss, tr_loss); push!(h.tr_acc, tr_acc); push!(h.te_acc, te_acc)
-    @printf "[%s] iter=%4d  bat=%4d  t=%5.0fs  loss=%.4f  tr=%.1f%%  te=%.1f%%\n" \
-        tag iter batches h._t_accum tr_loss (100tr_acc) (100te_acc)
+    @printf "[%s] iter=%4d  bat=%4d  t=%5.0fs  loss=%.4f  tr=%.1f%%  te=%.1f%%\n"   tag iter batches h._t_accum tr_loss (100tr_acc) (100te_acc)
     h._t_start = time_ns()
 end
 
@@ -209,8 +209,7 @@ function run_tadam!(; max_iter = 2000, eval_freq = 50,
     h.iters[end] != stats.iter &&
         snap!(h, stats.iter, batches[], stats.solution, "Tadam")
 
-    @printf "  Tadam final: %d accepted | %d rejected | %.1f%% rejection rate\n" \
-        h.n_ok h.n_rej (100 * h.n_rej / max(1, h.n_ok + h.n_rej))
+    @printf "  Tadam final: %d accepted | %d rejected | %.1f%% rejection rate\n"  h.n_ok h.n_rej (100 * h.n_rej / max(1, h.n_ok + h.n_rej))
     return stats, h
 end
 
