@@ -1,17 +1,15 @@
 # ================================================================
 # cifar_10_MLP.jl
-# CIFAR-10 Benchmark: Adam | AMSGrad | TRAdam
+# CIFAR-10 Benchmark: Adam | AMSGrad | Tadam
 #
 # Key features over the FashionMNIST script:
 #   - GPU-accelerated via CUDA.jl (auto-detects & falls back to CPU)
 #   - AMSGrad added as a convergence-fixed Adam baseline
-#   - ALL TRAdam hyper-parameters named and commented
+#   - ALL Tadam hyper-parameters named and commented
 #   - Publication-quality 6-panel figure (colorblind-safe, log axes)
 #   - Saves both .pdf and .png for paper inclusion
 # ================================================================
 
-using Pkg
-Pkg.activate("lux_test_env_2")
 
 using Lux, LuxCUDA
 using CUDA
@@ -98,7 +96,7 @@ end
 make_nlp() = LuxNLPModel(model, copy(ps0_dev), st, data_loader, loss_fn)
 
 # ----------------------------------------------------------------
-# 3.  History  (shared struct; high-frequency fields only used by TRAdam)
+# 3.  History  (shared struct; high-frequency fields only used by Tadam)
 # ----------------------------------------------------------------
 mutable struct Hist
     # Low-frequency snapshots (every eval_freq iterations)
@@ -108,7 +106,7 @@ mutable struct Hist
     tr_loss :: Vector{Float32}
     tr_acc  :: Vector{Float32}
     te_acc  :: Vector{Float32}
-    # TRAdam-only high-frequency diagnostics
+    # Tadam-only high-frequency diagnostics
     hf_iters :: Vector{Int}
     hf_delta :: Vector{Float64}   # trust-region radius Δ_k
     hf_rej   :: Vector{Float64}   # running rejection rate
@@ -156,11 +154,11 @@ function run_first_order!(rule, name; max_iter = 2000, eval_freq = 50)
 end
 
 # ----------------------------------------------------------------
-# 4b. Runner: TRAdam
+# 4b. Runner: Tadam
 # ----------------------------------------------------------------
 function run_tadam!(; max_iter = 2000, eval_freq = 50,
                      η1 = 0.10f0, kwargs...)
-    @info "=== TRAdam ==="
+    @info "=== Tadam ==="
     nlp     = make_nlp()
     h       = Hist()
     batches = Ref(0)
@@ -177,7 +175,7 @@ function run_tadam!(; max_iter = 2000, eval_freq = 50,
         push!(h.hf_rej,  total > 0 ? h.n_rej / total : 0.0)
 
         # ── periodic evaluation snapshot ─────────────────────────
-        iter % eval_freq == 0 && snap!(h, iter, batches[], solver.x, "TRAdam")
+        iter % eval_freq == 0 && snap!(h, iter, batches[], solver.x, "Tadam")
 
         # ── step acceptance book-keeping ─────────────────────────
         if solver.step_accepted
@@ -209,9 +207,9 @@ function run_tadam!(; max_iter = 2000, eval_freq = 50,
                   callback = cb, verbose = 0, η1, kwargs...)
 
     h.iters[end] != stats.iter &&
-        snap!(h, stats.iter, batches[], stats.solution, "TRAdam")
+        snap!(h, stats.iter, batches[], stats.solution, "Tadam")
 
-    @printf "  TRAdam final: %d accepted | %d rejected | %.1f%% rejection rate\n" \
+    @printf "  Tadam final: %d accepted | %d rejected | %.1f%% rejection rate\n" \
         h.n_ok h.n_rej (100 * h.n_rej / max(1, h.n_ok + h.n_rej))
     return stats, h
 end
@@ -219,11 +217,10 @@ end
 # ----------------------------------------------------------------
 # 5.  Run all experiments
 #
-#     TRAdam hyper-parameter guide (names match Section 2 of the paper):
+#     Tadam hyper-parameter guide (names match Section 2 of the paper):
 #       η1, η2  — acceptance thresholds for ρ_k  (η1 < η2 ≤ 1)
 #       γ1      — TR radius contraction factor   (0 < γ1 < 1)
 #       γ2      — TR radius expansion factor     (γ2 ≥ 1)
-#       γ3      — small-step reset scale         (implementation detail)
 #       β1      — first-moment  decay  (β_mom in paper)
 #       β2      — second-moment decay  (β_rms in paper)
 #       ε_v     — ε_Adam  (numerical stabiliser)
@@ -245,18 +242,19 @@ _, h_tadam   = let
         max_iter   = MAX_ITER,
         eval_freq  = EVAL_FREQ,
         # ── TR acceptance thresholds ──────────────────────────
-        η1   = 0.10f0,      # reject step  if ρ_k < η1
-        η2   = 0.55f0,      # expand TR    if ρ_k ≥ η2
+        η1   = 0.010f0,      # reject step  if ρ_k < η1
+        η2   = 0.85f0,      # expand TR    if ρ_k ≥ η2
         # ── TR radius update factors ──────────────────────────
-        γ1   = 0.50f0,      # contraction on rejection
-        γ2   = 2.00f0,      # expansion    on very good step
-        γ3   = 0.02f0,      # scale for stall-reset heuristic
+        γ1  = 0.80f0, 
+        γ2  = 1.20f0,       # expansion    on very good step
         # ── Adam momentum parameters ──────────────────────────
         β1   = 0.90f0,      # β_mom
         β2   = 0.99f0,      # β_rms
         ϵ_v  = 1f-7,        # ε_Adam
         # ── Cauchy-decrease model parameter ───────────────────
-        θ2   = 1.00f0,      # θ in Assumption 4 (Cauchy fraction)
+        # θ2   = 100.00f0,      # θ in Assumption 4 (Cauchy fraction)
+        θ1   = 1f-6,   #  
+        Δmax = 1f-2,
     )
     stats, h
 end
@@ -295,7 +293,7 @@ with_theme(pub_theme) do
         for (h, label, color) in [
             (h_adam,    "Adam",    C_ADAM),
             (h_amsgrad, "AMSGrad", C_AMSGRAD),
-            (h_tadam,   "TRAdam",  C_TADAM),
+            (h_tadam,   "Tadam",  C_TADAM),
         ]
             lines!(ax, getfield(h, xfield), getfield(h, yfield); color, label)
         end
@@ -332,7 +330,7 @@ with_theme(pub_theme) do
         xlabel = "Iteration k",
         ylabel = "Trust-region radius Δk",
         yscale = log10,
-        title  = "(e) Adaptive step size: Δk over iterations (TRAdam)")
+        title  = "(e) Adaptive step size: Δk over iterations (Tadam)")
     lines!(ax_e, h_tadam.hf_iters, h_tadam.hf_delta; color = C_TADAM, linewidth = 1.4)
 
     # ── (f): Running rejection rate ─────────────────────────────
@@ -340,20 +338,20 @@ with_theme(pub_theme) do
         xlabel = "Iteration k",
         ylabel = "Cumulative rejection rate",
         limits = (nothing, (0.0, 1.0)),
-        title  = "(f) TR step rejection rate over training (TRAdam)")
+        title  = "(f) TR step rejection rate over training (Tadam)")
     lines!(ax_f, h_tadam.hf_iters, h_tadam.hf_rej; color = C_TADAM, linewidth = 2.0)
 
     # ── shared caption ──────────────────────────────────────────
     Label(fig[4, :],
         "CIFAR-10 (N_train=$(N_TRAIN), N_test=$(N_TEST), batch=$(BATCH)).  " *
-        "Adam and AMSGrad use lr=$(LR); TRAdam adapts its step size automatically.\n" *
+        "Adam and AMSGrad use lr=$(LR); Tadam adapts its step size automatically.\n" *
         "Panels (a–d): three runs per method (seeds 42, 123, 456 recommended). " *
-        "Panels (e–f): TRAdam internal diagnostics showing self-tuning behavior.",
+        "Panels (e–f): Tadam internal diagnostics showing self-tuning behavior.",
         tellwidth = false, fontsize = 11, color = :gray40,
     )
 
-    save("cifar10_tradam_results.pdf", fig)
-    save("cifar10_tradam_results.png", fig; px_per_unit = 2)
+    save("cifar10_Tadam_results.pdf", fig)
+    save("cifar10_Tadam_results.png", fig; px_per_unit = 2)
     display(fig)
-    @info "Figures written: cifar10_tradam_results.{pdf,png}"
+    @info "Figures written: cifar10_Tadam_results.{pdf,png}"
 end

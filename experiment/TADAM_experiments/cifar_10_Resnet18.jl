@@ -1,6 +1,6 @@
 # ================================================================
 # cifar_10_Resnet18.jl
-# CIFAR-10 Benchmark: AdamW | AMSGrad | TRAdam
+# CIFAR-10 Benchmark: AdamW | AMSGrad | Tadam
 #
 # Key upgrades:
 #   - Multi-seed execution (Mean ± 1 Std Dev plotting)
@@ -154,10 +154,10 @@ function run_first_order!(rule, name, model, ps0_dev, st_dev, ps_template; max_i
 end
 
 # ----------------------------------------------------------------
-# 4b. Runner: TRAdam
+# 4b. Runner: Tadam
 # ----------------------------------------------------------------
 function run_tadam!(model, ps0_dev, st_dev, ps_template; max_iter=2000, eval_freq=50, η1=0.10f0, kwargs...)
-    @info "=== TRAdam ==="
+    @info "=== Tadam ==="
     nlp     = make_nlp(model, ps0_dev, st_dev)
     h       = Hist()
     batches = Ref(0)
@@ -174,7 +174,7 @@ function run_tadam!(model, ps0_dev, st_dev, ps_template; max_iter=2000, eval_fre
         push!(h.hf_rej, total > 0 ? h.n_rej / total : 0.0)
 
         # Snapshot
-        iter % eval_freq == 0 && snap!(h, iter, batches[], solver.x, model, st_dev, ps_template, "TRAdam")
+        iter % eval_freq == 0 && snap!(h, iter, batches[], solver.x, model, st_dev, ps_template, "Tadam")
 
         # Step acceptance
         if solver.step_accepted
@@ -197,9 +197,9 @@ function run_tadam!(model, ps0_dev, st_dev, ps_template; max_iter=2000, eval_fre
     end
 
     stats = tadam(nlp; max_iter, atol=1f-8, rtol=1f-5, callback=cb, verbose=0, η1, kwargs...)
-    h.iters[end] != stats.iter && snap!(h, stats.iter, batches[], stats.solution, model, st_dev, ps_template, "TRAdam")
+    h.iters[end] != stats.iter && snap!(h, stats.iter, batches[], stats.solution, model, st_dev, ps_template, "Tadam")
 
-    @printf "  TRAdam final: %d accepted | %d rejected | %.1f%% rej rate\n" h.n_ok h.n_rej (100 * h.n_rej / max(1, h.n_ok + h.n_rej))
+    @printf "  Tadam final: %d accepted | %d rejected | %.1f%% rej rate\n" h.n_ok h.n_rej (100 * h.n_rej / max(1, h.n_ok + h.n_rej))
     return h
 end
 
@@ -231,7 +231,7 @@ for seed in SEEDS
     model, ps_template, ps0_dev, st_dev = create_model_and_state(seed)
     push!(hists_tadam, run_tadam!(model, ps0_dev, st_dev, ps_template; 
         max_iter=MAX_ITER, eval_freq=EVAL_FREQ,
-        η1=0.10f0, η2=0.55f0, γ1=0.50f0, γ2=2.00f0, γ3=0.02f0,
+        η1=0.10f0, η2=0.55f0, γ1=0.50f0, γ2=2.00f0, 
         β1=0.90f0, β2=0.99f0, ϵ_v=1f-7, θ2=1.00f0
     ))
 end
@@ -269,27 +269,27 @@ with_theme(pub_theme) do
     ax_a = Axis(fig[1,1]; xlabel="Minibatches", ylabel="Train loss", yscale=log10, title="(a) Train loss vs. iterations")
     plot_with_std!(ax_a, :batches, :tr_loss, hists_adamw,   C_ADAMW,   "AdamW")
     plot_with_std!(ax_a, :batches, :tr_loss, hists_amsgrad, C_AMSGRAD, "AMSGrad")
-    plot_with_std!(ax_a, :batches, :tr_loss, hists_tadam,   C_TADAM,   "TRAdam")
+    plot_with_std!(ax_a, :batches, :tr_loss, hists_tadam,   C_TADAM,   "Tadam")
     axislegend(ax_a; position=:rt)
 
     # (b) Train loss vs Time
     ax_b = Axis(fig[1,2]; xlabel="Wall-clock time (s)", ylabel="Train loss", yscale=log10, title="(b) Train loss vs. time")
     plot_with_std!(ax_b, :times, :tr_loss, hists_adamw,   C_ADAMW,   "AdamW")
     plot_with_std!(ax_b, :times, :tr_loss, hists_amsgrad, C_AMSGRAD, "AMSGrad")
-    plot_with_std!(ax_b, :times, :tr_loss, hists_tadam,   C_TADAM,   "TRAdam")
+    plot_with_std!(ax_b, :times, :tr_loss, hists_tadam,   C_TADAM,   "Tadam")
 
     # (c) Test Acc vs Eval
     ax_c = Axis(fig[2,1]; xlabel="Minibatches", ylabel="Test accuracy", title="(c) Test accuracy vs. iterations")
     plot_with_std!(ax_c, :batches, :te_acc, hists_adamw,   C_ADAMW,   "AdamW")
     plot_with_std!(ax_c, :batches, :te_acc, hists_amsgrad, C_AMSGRAD, "AMSGrad")
-    plot_with_std!(ax_c, :batches, :te_acc, hists_tadam,   C_TADAM,   "TRAdam")
+    plot_with_std!(ax_c, :batches, :te_acc, hists_tadam,   C_TADAM,   "Tadam")
     axislegend(ax_c; position=:rb)
 
     # (d) Test Acc vs Time
     ax_d = Axis(fig[2,2]; xlabel="Wall-clock time (s)", ylabel="Test accuracy", title="(d) Test accuracy vs. time")
     plot_with_std!(ax_d, :times, :te_acc, hists_adamw,   C_ADAMW,   "AdamW")
     plot_with_std!(ax_d, :times, :te_acc, hists_amsgrad, C_AMSGRAD, "AMSGrad")
-    plot_with_std!(ax_d, :times, :te_acc, hists_tadam,   C_TADAM,   "TRAdam")
+    plot_with_std!(ax_d, :times, :te_acc, hists_tadam,   C_TADAM,   "Tadam")
 
     # (e & f) High-Frequency Diagnostics (Only plot the first seed for clarity)
     ax_e = Axis(fig[3,1]; xlabel="Iteration k", ylabel="Radius Δk", yscale=log10, title="(e) Adaptive step size (Seed 1)")
@@ -300,7 +300,7 @@ with_theme(pub_theme) do
 
     Label(fig[4, :], "CIFAR-10 (N_train=$(N_TRAIN), N_test=$(N_TEST), batch=$(BATCH)). AdamW & AMSGrad use lr=$(LR), wd=$(WD).\nCurves denote mean ± 1 std dev across 3 random seeds.", tellwidth=false, fontsize=11, color=:gray40)
 
-    save("cifar10_tradam_results.pdf", fig)
+    save("cifar10_Tadam_results.pdf", fig)
     display(fig)
-    @info "Figures written: cifar10_tradam_results.pdf"
+    @info "Figures written: cifar10_Tadam_results.pdf"
 end

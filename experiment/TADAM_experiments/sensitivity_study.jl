@@ -3,7 +3,7 @@
 #
 # Key message:
 #   Adam test accuracy varies wildly across learning rates.
-#   TRAdam accuracy is stable across 3 decades of initial Δ₀,
+#   Tadam accuracy is stable across 3 decades of initial Δ₀,
 #   demonstrating that its automatic step-size adaptation removes
 #   the need for careful learning-rate tuning.
 #
@@ -113,7 +113,7 @@ function run_adam_lr(lr::Float32; max_iter=800, eval_freq=50)
 end
 
 # ────────────────────────────────────────────────────────────────
-# 4b. TRAdam runner (one Δ₀ value)
+# 4b. Tadam runner (one Δ₀ value)
 #
 # NOTE: the keyword that sets the initial TR radius depends on your
 #       JSOSolvers version.  Try `Δ = Δ0` first; if that errors,
@@ -149,14 +149,13 @@ function run_tadam_delta0(Δ0::Float32; max_iter=800, eval_freq=50)
         η2  = 0.55f0,   # expand TR    if ρ_k ≥ η₂
         γ1  = 0.50f0,   # contraction factor
         γ2  = 2.00f0,   # expansion factor
-        γ3  = 0.02f0,   # stall-reset scale
         β1  = 0.90f0,   # β_mom
         β2  = 0.99f0,   # β_rms
         ϵ_v = 1f-7,     # ε_Adam
-        θ2  = 1.00f0,   # Cauchy-decrease fraction θ
+        # θ2  = 100.00f0,   # Cauchy-decrease fraction θ
     )
 
-    @printf "  TRAdam Δ₀=%.0e  →  final te_acc=%.3f\n" Δ0 h.te_acc[end]
+    @printf "  Tadam Δ₀=%.0e  →  final te_acc=%.3f\n" Δ0 h.te_acc[end]
     return h
 end
 
@@ -172,16 +171,16 @@ const EVAL_FREQ = 50
 println("=== Adam LR sweep ===")
 adam_hists = [run_adam_lr(lr;   max_iter=MAX_ITER, eval_freq=EVAL_FREQ) for lr  in ADAM_LRS]
 
-println("\n=== TRAdam Δ₀ sweep ===")
+println("\n=== Tadam Δ₀ sweep ===")
 tadam_hists = [run_tadam_delta0(Δ0; max_iter=MAX_ITER, eval_freq=EVAL_FREQ) for Δ0 in TADAM_Δ0S]
 
 # ────────────────────────────────────────────────────────────────
 # 6. Publication figure  (5 panels)
 #
 #   (a) Adam    test-accuracy curves (one curve per lr)
-#   (b) TRAdam  test-accuracy curves (one curve per Δ₀)
+#   (b) Tadam  test-accuracy curves (one curve per Δ₀)
 #   (c) Adam    train-loss curves    (log scale)
-#   (d) TRAdam  train-loss curves    (log scale)
+#   (d) Tadam  train-loss curves    (log scale)
 #   (e) Summary: final test accuracy vs hyperparameter value
 # ────────────────────────────────────────────────────────────────
 
@@ -193,7 +192,7 @@ ADAM_COLORS = [
     RGBf(0.95, 0.88, 0.55),   # lr = 0.0001  (too slow)
 ]
 
-# Cool palette for TRAdam (dark = large Δ₀)
+# Cool palette for Tadam (dark = large Δ₀)
 TADAM_COLORS = [
     RGBf(0.75, 0.90, 1.00),   # Δ₀ = 0.01
     RGBf(0.35, 0.60, 0.90),   # Δ₀ = 0.1
@@ -228,10 +227,10 @@ with_theme(pub_theme) do
     end
     axislegend(ax_a; position=:rb)
 
-    # ── (b) TRAdam test-accuracy curves ──────────────────────────
+    # ── (b) Tadam test-accuracy curves ──────────────────────────
     ax_b = Axis(fig[1,2];
         xlabel = "Minibatches", ylabel = "Test accuracy",
-        title  = "(b) TRAdam: robustness to initial radius Δ₀")
+        title  = "(b) Tadam: robustness to initial radius Δ₀")
     for (h, col, lbl) in zip(tadam_hists, TADAM_COLORS, TADAM_LABELS)
         lines!(ax_b, h.batches, h.te_acc; color=col, label=lbl)
     end
@@ -250,10 +249,10 @@ with_theme(pub_theme) do
     end
     axislegend(ax_c; position=:rt)
 
-    # ── (d) TRAdam train-loss (log scale) ────────────────────────
+    # ── (d) Tadam train-loss (log scale) ────────────────────────
     ax_d = Axis(fig[2,2];
         xlabel = "Minibatches", ylabel = "Train loss", yscale=log10,
-        title  = "(d) TRAdam: train loss by initial Δ₀")
+        title  = "(d) Tadam: train loss by initial Δ₀")
     for (h, col, lbl) in zip(tadam_hists, TADAM_COLORS, TADAM_LABELS)
         lines!(ax_d, h.batches, h.tr_loss; color=col, label=lbl)
     end
@@ -279,7 +278,7 @@ with_theme(pub_theme) do
            label = "Adam range")
     hspan!(ax_e, minimum(final_tadam), maximum(final_tadam);
            color = (RGBf(0.00, 0.45, 0.70), 0.12),
-           label = "TRAdam range")
+           label = "Tadam range")
 
     # Individual configurations
     scatter!(ax_e, ADAM_LRS,  final_adam;
@@ -287,7 +286,7 @@ with_theme(pub_theme) do
              label="Adam (lr sweep)")
     scatter!(ax_e, TADAM_Δ0S, final_tadam;
              color=TADAM_COLORS, markersize=15, marker=:circle,
-             label="TRAdam (Δ₀ sweep)")
+             label="Tadam (Δ₀ sweep)")
 
     # Annotate with standard deviation — the headline statistic
     σ_adam  = round(std(final_adam)  * 100; digits=2)
@@ -298,7 +297,7 @@ with_theme(pub_theme) do
           text="σ(Adam) = $(σ_adam)%  ← larger = more sensitive",
           color=RGBf(0.70, 0.10, 0.00), fontsize=10)
     text!(ax_e, x_ann, minimum(final_tadam) - 0.012f0;
-          text="σ(TRAdam) = $(σ_tadam)%  ← smaller = more robust",
+          text="σ(Tadam) = $(σ_tadam)%  ← smaller = more robust",
           color=RGBf(0.00, 0.25, 0.55), fontsize=10)
 
     axislegend(ax_e; position=:lt)
@@ -308,7 +307,7 @@ with_theme(pub_theme) do
         "FashionMNIST (N=$(N_TRAIN) train, batch=$(BATCH), $(MAX_ITER) iterations). " *
         "Both methods started from the same random seed.\n" *
         "Panels (a–d): training dynamics. " *
-        "Panel (e): σ measures sensitivity — lower is better for TRAdam.",
+        "Panel (e): σ measures sensitivity — lower is better for Tadam.",
         tellwidth=false, fontsize=10, color=:gray40)
 
     save("sensitivity_study.pdf", fig)
@@ -325,12 +324,12 @@ println("Adam:")
 for (lr, h) in zip(ADAM_LRS, adam_hists)
     @printf "  lr = %.0e   best_te=%.3f   final_te=%.3f\n" lr maximum(h.te_acc) h.te_acc[end]
 end
-println("TRAdam:")
+println("Tadam:")
 for (Δ0, h) in zip(TADAM_Δ0S, tadam_hists)
     @printf "  Δ₀ = %.0e   best_te=%.3f   final_te=%.3f\n" Δ0 maximum(h.te_acc) h.te_acc[end]
 end
 σ_adam  = round(std([h.te_acc[end] for h in adam_hists])  * 100; digits=2)
 σ_tadam = round(std([h.te_acc[end] for h in tadam_hists]) * 100; digits=2)
 println("\nσ(Adam final te_acc)  = $(σ_adam)%")
-println("σ(TRAdam final te_acc) = $(σ_tadam)%")
+println("σ(Tadam final te_acc) = $(σ_tadam)%")
 println("Sensitivity ratio: $(round(σ_adam / max(σ_tadam, 1e-4); digits=1))×")
