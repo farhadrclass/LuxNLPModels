@@ -185,8 +185,7 @@ function snap!(h::Hist, iter, batches, ps_vec, tag, gn)
     push!(h.iters,   iter);    push!(h.batches, batches); push!(h.times, h._t_accum)
     push!(h.tr_loss, tr_loss); push!(h.tr_acc,  tr_acc);  push!(h.te_acc, te_acc)
     push!(h.gnorm,   Float32(gn))
-    @printf "[%s] iter=%4d  bat=%4d  t=%5.0fs  loss=%.4f  tr=%.1f%%  te=%.1f%%  |g|=%.4f\n" \
-        tag iter batches h._t_accum tr_loss (100tr_acc) (100te_acc) gn
+    @printf "[%s] iter=%4d  bat=%4d  t=%5.0fs  loss=%.4f  tr=%.1f%%  te=%.1f%%  |g|=%.4f\n"  tag iter batches h._t_accum tr_loss (100tr_acc) (100te_acc) gn
     h._t_start = time_ns()
 end
 
@@ -312,8 +311,7 @@ function run_tadam!(; max_iter = 2000, eval_freq = 500,
         snap!(h, stats.iter, batches[], stats.solution, "Tadam", Float32(norm(g_final)))
     end
 
-    @printf "  Tadam final: %d accepted | %d rejected | %.1f%% rejection rate\n" \
-        h.n_ok h.n_rej (100 * h.n_rej / max(1, h.n_ok + h.n_rej))
+    @printf "  Tadam final: %d accepted | %d rejected | %.1f%% rejection rate\n"    h.n_ok h.n_rej (100 * h.n_rej / max(1, h.n_ok + h.n_rej))
     return stats, h
 end
 
