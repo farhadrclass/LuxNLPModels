@@ -283,6 +283,30 @@ function run_tadam!(; max_g_evals = 2000, eval_freq = 500, η1 = 0.10f0, kwargs.
     return stats, h
 end
 
+
+
+
+
+
+
+# ----------------------------------------------------------------
+# Warmup Compiler (Prevents JIT overhead from ruining benchmarks)
+# ----------------------------------------------------------------
+@info "Warming up Zygote/GPU compiler (this will take 1-3 minutes)..."
+let
+    # Create tiny dummy arrays just to trigger compilation
+    dummy_x = CUDA.zeros(Float32, 32, 32, 3, 2)
+    dummy_y = CUDA.zeros(Float32, 10, 2)
+    
+    # Run one forward and backward pass
+    _, dummy_back = Zygote.pullback(ps_dev_namedtuple) do p
+        ŷ, _ = Lux.apply(model, dummy_x, p, st_dev)
+        loss_fn(ŷ, dummy_y)
+    end
+    dummy_back(1f0)
+end
+@info "Warmup complete! Starting real benchmarks..."
+
 # ----------------------------------------------------------------
 # 5. Execute Experiments
 # ----------------------------------------------------------------
