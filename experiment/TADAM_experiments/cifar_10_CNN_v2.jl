@@ -21,6 +21,9 @@ using CUDA
 using ComponentArrays
 using NLPModels, JSOSolvers, LuxNLPModels
 using Optimisers
+# Never block on an interactive "download this dataset? [y/n]" prompt: on a
+# first run MLDatasets would otherwise wait forever for stdin.
+ENV["DATADEPS_ALWAYS_ACCEPT"] = "true"
 using MLDatasets
 using MLUtils
 using OneHotArrays
@@ -176,31 +179,58 @@ end
 make_nlp() = LuxNLPModel(model, copy(ps0), st, make_data_loader(), loss_fn; dev)
 
 @printf "Total parameters: %d\n" length(ps0)
-initial_nlp = make_nlp()
-CUDA.functional() && @assert initial_nlp.meta.x0 isa CuArray "GPU solver vector was not created on CUDA"
-@printf "Initial train batch loss: %.4f\n\n" obj(initial_nlp, initial_nlp.meta.x0)
+flush(stdout)
 
-# One-time JIT compilation of every hot path *before* the timed runs, so the
-# per-method timers and the first printed iteration are not dominated by
-# compilation. On the very first run this block alone can take a minute or two
-# (Zygote + CUDA kernel compilation); afterwards it is fast.
-@info "Warming up: compiling forward / backward / update + evaluation paths (one-time)…"
-let
-    t0 = time_ns()
-    warmup_nlp = make_nlp()
-    warmup_ps  = ComponentArray(ps0) |> dev
-    wx, wy     = warmup_nlp.current_batch
-    _, wback = Zygote.pullback(warmup_ps) do p
-        ŷ, _ = Lux.apply(model, wx, p, st)
-        loss_fn(ŷ, wy)
-    end
-    wg   = wback(one(Float32))[1]
-    wopt = Optimisers.setup(Optimisers.Adam(1f-3), warmup_ps)
-    Optimisers.update(wopt, warmup_ps, wg)
-    eval_metrics(warmup_ps)                  # also compile the batched inference path
+# ----------------------------------------------------------------
+# Warm-up / one-time compilation.
+#
+# Julia compiles Zygote + Lux (+ CUDA) kernels on FIRST use. That compilation
+# is what makes the first run feel frozen: nothing prints while it works, and on
+# a fresh `julia script.jl` process it can take SEVERAL MINUTES. Run this file
+# inside a PERSISTENT REPL instead (VS Code Julia: "Execute active File in REPL",
+# or `include("...")`) so the compilation cost is paid only ONCE per session.
+#
+# The stages below print as they run, so if it stalls you can see exactly where.
+# Stages 1-4 use a 2-sample slice: they compile everything but compute almost
+# nothing, so a long pause there is pure compilation. Stage 5 (evaluation) is
+# the CPU-vs-GPU tell: instant on GPU, slow on CPU.
+# ----------------------------------------------------------------
+@info "Warm-up begins (one-time JIT compilation). First run can take several minutes."
+flush(stderr)
+
+function warmstep(msg, f)
+    print(rpad(msg, 46)); flush(stdout)
+    local r
+    t = @elapsed (r = f())
     CUDA.functional() && CUDA.synchronize()
-    @info @sprintf("Warm-up done in %.1fs.", (time_ns() - t0) / 1e9)
+    @printf("done in %7.1fs\n", t); flush(stdout)
+    return r
 end
+
+let
+    wnlp = warmstep("[1/5] build wrapper + data loader", make_nlp)
+    CUDA.functional() && @assert wnlp.meta.x0 isa CuArray "GPU solver vector not on CUDA — check device setup"
+    wps  = ComponentArray(ps0) |> dev
+    wx   = wnlp.current_batch[1][:, :, :, 1:2]     # 2 samples: compile, don't compute
+    wy   = wnlp.current_batch[2][:, 1:2]
+
+    l0 = warmstep("[2/5] NLP obj (forward pass)", () -> obj(wnlp, wnlp.meta.x0))
+    @printf("      initial train-batch loss = %.4f\n", l0); flush(stdout)
+
+    wg = warmstep("[3/5] forward + backward (pullback)", () -> begin
+        _, back = Zygote.pullback(p -> loss_fn(first(Lux.apply(model, wx, p, st)), wy), wps)
+        back(one(Float32))[1]
+    end)
+
+    warmstep("[4/5] optimiser update", () -> begin
+        opt = Optimisers.setup(Optimisers.Adam(1f-3), wps)
+        Optimisers.update(opt, wps, wg)
+    end)
+
+    warmstep("[5/5] batched evaluation path", () -> eval_metrics(wps))
+end
+@info "Warm-up complete. Timed runs start now."
+flush(stderr)
 
 # ----------------------------------------------------------------
 # 3.  History struct
