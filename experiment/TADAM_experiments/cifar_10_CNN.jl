@@ -110,7 +110,7 @@ function eval_metrics(ps_vec)
             # Forward pass on the GPU
             ŷ, _ = Lux.apply(model, bx, ps_s, st_dev)
             
-            # 🚀 NEW: Safely extract loss without scalar indexing stalls
+            #  Safely extract loss without scalar indexing stalls
             tot_loss += Float32(Array(loss_fn(ŷ, by))[]) * length(idx)
             
             # Pull ONLY lightweight predictions back to CPU to compute accuracy
@@ -263,7 +263,7 @@ end
 #       Δ0      — initial TR radius (set via JSOSolvers keyword or default)
 # ----------------------------------------------------------------
 const MAX_ITER  = 2000
-const EVAL_FREQ = 50
+const EVAL_FREQ = 150
 const LR        = 3f-4    # learning rate for Adam and AMSGrad
 
 _, h_adam    = run_first_order!(
