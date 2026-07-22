@@ -1,7 +1,6 @@
 # ================================================================
 # cifar_10_CNN.jl
 # CIFAR-10 Benchmark: Adam | AMSGrad | Tadam
-#
 # ================================================================
 
 using Lux, LuxCUDA
@@ -12,30 +11,33 @@ using Optimisers
 using MLDatasets
 using MLUtils
 using OneHotArrays
-using NNlib: logsoftmax
+using NNlib: logitcrossentropy
 using Random, Statistics, Printf, LinearAlgebra
 using CairoMakie
 import CairoMakie: Axis
 
 # ----------------------------------------------------------------
-# 0.  GPU / Device
+# 0.  GPU / Device Setup
 # ----------------------------------------------------------------
 const USE_GPU = CUDA.functional()
 USE_GPU && @info "CUDA GPU: $(CUDA.name(CUDA.device()))"
 USE_GPU || @warn "No CUDA GPU found — falling back to CPU (slower)"
 
-# Universal device transfer (allows scalar indexing fallback just in case)
+# Force maximum tensor core usage
+USE_GPU && CUDA.math_mode!(CUDA.FAST_MATH)
+
 to_dev(x) = USE_GPU ? CUDA.cu(x) : x
-USE_GPU && CUDA.allowscalar(true)
+
+# FATAL TO PERFORMANCE IF TRUE: Set to false to prevent PCIe bottleneck
+USE_GPU && CUDA.allowscalar(false)
 
 # ----------------------------------------------------------------
-# 1.  CIFAR-10  (32 × 32 × 3, 10 classes, already Float32 ∈ [0,1])
+# 1.  CIFAR-10  (32 × 32 × 3, 10 classes, Float32 ∈ [0,1])
 # ----------------------------------------------------------------
 @info "Loading CIFAR-10..."
-tr_x_raw, tr_y_raw = CIFAR10.traindata(Float32)   # → (32,32,3,50 000)
-te_x_raw, te_y_raw = CIFAR10.testdata(Float32)    # → (32,32,3,10 000)
+tr_x_raw, tr_y_raw = CIFAR10.traindata(Float32)   
+te_x_raw, te_y_raw = CIFAR10.testdata(Float32)    
 
-# Sub-sample for speed (use N_TRAIN=50_000 for the final paper numbers)
 N_TRAIN, N_TEST = 20_000, 2_000
 
 train_x_cpu = tr_x_raw[:, :, :, 1:N_TRAIN]
@@ -43,18 +45,39 @@ train_y_cpu = onehotbatch(tr_y_raw[1:N_TRAIN], 0:9)
 test_x_cpu  = te_x_raw[:, :, :, 1:N_TEST]
 test_y_cpu  = onehotbatch(te_y_raw[1:N_TEST], 0:9)
 
-#  Push everything to the GPU permanently to eliminate PCIe transfer overhead
+# For ultra-fast chunked evaluation
 const train_x_gpu = to_dev(train_x_cpu)
 const train_y_gpu = to_dev(train_y_cpu)
 const test_x_gpu  = to_dev(test_x_cpu)
 const test_y_gpu  = to_dev(test_y_cpu)
 
-const BATCH = 256
-# Point the DataLoader directly at the GPU arrays
-data_loader = DataLoader(
-    (train_x_gpu, train_y_gpu);
+const BATCH = 2048 # Sized 
+
+# Base CPU Dataloader (prevents scalar indexing when shuffling)
+cpu_loader = DataLoader(
+    (train_x_cpu, train_y_cpu);
     batchsize = BATCH, shuffle = true,
 )
+
+# Custom wrapper to stream batches to the GPU dynamically for NLPModels
+struct GPUDataloader
+    cpu_loader
+end
+Base.iterate(d::GPUDataloader) = begin
+    res = iterate(d.cpu_loader)
+    res === nothing && return nothing
+    (batch, state) = res
+    return ((to_dev(batch[1]), to_dev(batch[2])), state)
+end
+Base.iterate(d::GPUDataloader, state) = begin
+    res = iterate(d.cpu_loader, state)
+    res === nothing && return nothing
+    (batch, next_state) = res
+    return ((to_dev(batch[1]), to_dev(batch[2])), next_state)
+end
+Base.length(d::GPUDataloader) = length(d.cpu_loader)
+
+data_loader = GPUDataloader(cpu_loader)
 
 # ----------------------------------------------------------------
 # 2.  CNN model
@@ -76,44 +99,42 @@ model = Chain(
 rng_init = MersenneTwister(42)
 ps_cpu, st_cpu = Lux.setup(rng_init, model)
 
-const ps_template = ComponentArray(ps_cpu)        # CPU template (for axis re-use)
-const ps0_dev     = to_dev(copy(ps_template))     # starting point on correct device
-const st_dev      = to_dev(st_cpu)                # correct device state
+const ps_template = ComponentArray(ps_cpu)        
+const ps0_dev     = to_dev(copy(ps_template))     
+const st_dev      = to_dev(st_cpu)                
 
-loss_fn(ŷ, y) = mean(-sum(y .* logsoftmax(ŷ; dims=1); dims=1))
+# Highly optimized fused cross-entropy directly handles logits
+loss_fn(ŷ, y) = mean(logitcrossentropy(ŷ, y; dims=1))
 
 # ----------------------------------------------------------------
-# GPU-accelerated and memory-safe batched evaluation
+# Memory-Safe, GPU-Accelerated Batched Evaluation
 # ----------------------------------------------------------------
 function eval_metrics(ps_vec)
-    # Check if ps_vec is already a ComponentArray to avoid double-wrapping, 
-    # but ensure it's forced to the GPU structure.
     ps_s = ps_vec isa ComponentArray ? ps_vec : ComponentArray(to_dev(ps_vec), getaxes(ps_template))
     
     function batched_eval(x_data_gpu, y_data_gpu)
         N = size(x_data_gpu, 4)
-        chunk = 1000 # Send 1000 images at a time to maximize GPU efficiency safely
+        chunk = 10000 # Increased chunk size 
         tot_loss = 0f0
         tot_correct = 0
         
         for i in 1:chunk:N
             idx = i:min(i+chunk-1, N)
             
-            # Slicing happens directly on the GPU! No PCIe transfer overhead.
-            bx = x_data_gpu[:, :, :, idx]
-            by = y_data_gpu[:, idx]
+            # @views prevents memory allocation during slicing
+            bx = @view x_data_gpu[:, :, :, idx]
+            by = @view y_data_gpu[:, idx]
             
-            # Forward pass on the GPU
             ŷ, _ = Lux.apply(model, bx, ps_s, st_dev)
             
-            # Safely handle both primitive scalars and 0-D GPU arrays from Lux/CUDA
             l_val = loss_fn(ŷ, by)
             tot_loss += (l_val isa AbstractArray ? Float32(Array(l_val)[]) : Float32(l_val)) * length(idx)
             
-            # Pull ONLY lightweight predictions back to CPU to compute accuracy
-            ŷ_cpu = Array(ŷ)
-            by_cpu = Array(by)
-            tot_correct += sum(onecold(ŷ_cpu) .== onecold(by_cpu))
+            # Compute accuracy strictly on the GPU to avoid pipeline stalls
+            correct_gpu = sum(argmax(ŷ, dims=1) .== argmax(by, dims=1))
+            
+            # Transfer only the single scalar sum to the CPU
+            tot_correct += Int(first(Array(correct_gpu)))
         end
         return tot_loss / N, Float32(tot_correct) / N
     end
@@ -160,10 +181,10 @@ end
 # ----------------------------------------------------------------
 # 4a. Runner: first-order Optimisers.jl methods
 # ----------------------------------------------------------------
-function run_first_order!(rule, name; max_iter = 2000, eval_freq = 50)
+function run_first_order!(rule, name; max_iter = 2000, eval_freq = 500)
     @info "=== $name ==="
     nlp     = make_nlp()
-    x       = to_dev(copy(nlp.meta.x0)) # Force x0 to start on GPU
+    x       = to_dev(copy(nlp.meta.x0))
     g       = similar(x)
     h       = Hist()
     batches = 0
@@ -176,7 +197,6 @@ function run_first_order!(rule, name; max_iter = 2000, eval_freq = 50)
         
         objgrad!(nlp, x, g)
         
-        # IN-PLACE update keeps the ComponentArray structure intact on the GPU!
         opt, g_opt = Optimisers.apply!(opt, x, g)
         @. x -= g_opt
         
@@ -189,7 +209,7 @@ end
 # ----------------------------------------------------------------
 # 4b. Runner: Tadam
 # ----------------------------------------------------------------
-function run_tadam!(; max_iter = 2000, eval_freq = 50,
+function run_tadam!(; max_iter = 2000, eval_freq = 500,
                       η1 = 0.10f0, kwargs...)
     @info "=== Tadam ==="
     nlp     = make_nlp()
@@ -240,7 +260,7 @@ end
 # 5.  Run all experiments
 # ----------------------------------------------------------------
 const MAX_ITER  = 2000
-const EVAL_FREQ = 100  # Bumped to 100 to give the GPU loop more time to breathe between evaluations
+const EVAL_FREQ = 500  # Dramatically reduces pipeline synchronization halts
 const LR        = 3f-4
 
 _, h_adam    = run_first_order!(
@@ -299,7 +319,7 @@ with_theme(pub_theme) do
         for (h, label, color) in [
             (h_adam,    "Adam",    C_ADAM),
             (h_amsgrad, "AMSGrad", C_AMSGRAD),
-            (h_tadam,   "Tadam",  C_TADAM),
+            (h_tadam,   "Tadam",   C_TADAM),
         ]
             lines!(ax, getfield(h, xfield), getfield(h, yfield); color, label)
         end
