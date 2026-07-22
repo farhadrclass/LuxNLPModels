@@ -41,9 +41,9 @@ te_x_raw, te_y_raw = CIFAR10.testdata(Float32)
 N_TRAIN, N_TEST = 20_000, 2_000
 
 train_x_cpu = tr_x_raw[:, :, :, 1:N_TRAIN]
-train_y_cpu = onehotbatch(tr_y_raw[1:N_TRAIN], 0:9)
+train_y_cpu = Float32.(onehotbatch(tr_y_raw[1:N_TRAIN], 0:9))
 test_x_cpu  = te_x_raw[:, :, :, 1:N_TEST]
-test_y_cpu  = onehotbatch(te_y_raw[1:N_TEST], 0:9)
+test_y_cpu  = Float32.(onehotbatch(te_y_raw[1:N_TEST], 0:9))
 
 # For ultra-fast chunked evaluation
 const train_x_gpu = to_dev(train_x_cpu)
@@ -157,6 +157,7 @@ mutable struct Hist
     tr_loss :: Vector{Float32}
     tr_acc  :: Vector{Float32}
     te_acc  :: Vector{Float32}
+    gnorm   :: Vector{Float32}
     hf_iters :: Vector{Int}
     hf_delta :: Vector{Float64}
     hf_rej   :: Vector{Float64}
@@ -166,18 +167,18 @@ mutable struct Hist
     _t_start :: UInt64
 end
 
-Hist() = Hist(Int[], Int[], Float64[], Float32[], Float32[], Float32[],
+Hist() = Hist(Int[], Int[], Float64[], Float32[], Float32[], Float32[], Float32[],
               Int[], Float64[], Float64[], 0, 0, 0.0, time_ns())
 
-function snap!(h::Hist, iter, batches, ps_vec, tag)
+function snap!(h::Hist, iter, batches, ps_vec, tag, gn)
     h._t_accum += (time_ns() - h._t_start) / 1e9
     tr_loss, tr_acc, te_acc = eval_metrics(ps_vec)
     push!(h.iters, iter);  push!(h.batches, batches); push!(h.times, h._t_accum)
     push!(h.tr_loss, tr_loss); push!(h.tr_acc, tr_acc); push!(h.te_acc, te_acc)
-    @printf "[%s] iter=%4d  bat=%4d  t=%5.0fs  loss=%.4f  tr=%.1f%%  te=%.1f%%\n"   tag iter batches h._t_accum tr_loss (100tr_acc) (100te_acc)
+    push!(h.gnorm, Float32(gn))
+    @printf "[%s] iter=%4d  bat=%4d  t=%5.0fs  loss=%.4f  tr=%.1f%%  te=%.1f%%  |g|=%.4f\n"   tag iter batches h._t_accum tr_loss (100tr_acc) (100te_acc) gn
     h._t_start = time_ns()
 end
-
 # ----------------------------------------------------------------
 # 4a. Runner: first-order Optimisers.jl methods
 # ----------------------------------------------------------------
@@ -192,10 +193,13 @@ function run_first_order!(rule, name; max_iter = 2000, eval_freq = 500)
     h._t_start = time_ns()
     
     for i in 0:max_iter
-        i % eval_freq == 0 && snap!(h, i, batches, x, name)
-        i == max_iter && break
-        
+        # Evaluate objective and gradient on the current minibatch
         objgrad!(nlp, x, g)
+        gn = norm(g) 
+        
+        # Snap using the freshly calculated gradient norm
+        i % eval_freq == 0 && snap!(h, i, batches, x, name, gn)
+        i == max_iter && break
         
         opt, g_opt = Optimisers.apply!(opt, x, g)
         @. x -= g_opt
@@ -225,7 +229,7 @@ function run_tadam!(; max_iter = 2000, eval_freq = 500,
         total = h.n_ok + h.n_rej
         push!(h.hf_rej,  total > 0 ? h.n_rej / total : 0.0)
 
-        iter % eval_freq == 0 && snap!(h, iter, batches[], solver.x, "Tadam")
+        iter % eval_freq == 0 && snap!(h, iter, batches[], solver.x, "Tadam", norm(solver.gx))
 
         if solver.step_accepted
             h.n_ok  += 1
@@ -249,8 +253,11 @@ function run_tadam!(; max_iter = 2000, eval_freq = 500,
     stats = tadam(nlp; max_iter, atol = 1f-8, rtol = 1f-5,
                   callback = cb, verbose = 0, η1, kwargs...)
 
-    h.iters[end] != stats.iter &&
-        snap!(h, stats.iter, batches[], stats.solution, "Tadam")
+    if h.iters[end] != stats.iter
+        g_final = similar(stats.solution)
+        objgrad!(nlp, stats.solution, g_final)
+        snap!(h, stats.iter, batches[], stats.solution, "Tadam", norm(g_final))
+    end
 
     @printf "  Tadam final: %d accepted | %d rejected | %.1f%% rejection rate\n"  h.n_ok h.n_rej (100 * h.n_rej / max(1, h.n_ok + h.n_rej))
     return stats, h
@@ -313,7 +320,7 @@ pub_theme = Theme(
 )
 
 with_theme(pub_theme) do
-    fig = Figure(size = (900, 940))
+    fig = Figure(size = (900, 1150))
 
     function add_curves!(ax, xfield, yfield)
         for (h, label, color) in [
@@ -363,7 +370,16 @@ with_theme(pub_theme) do
         title  = "(f) TR step rejection rate over training (Tadam)")
     lines!(ax_f, h_tadam.hf_iters, h_tadam.hf_rej; color = C_TADAM, linewidth = 2.0)
 
-    Label(fig[4, :],
+    ax_g = Axis(fig[4, 1:2]; 
+    xlabel = "Minibatches (gradient evaluations)",
+    ylabel = "Minibatch Gradient Norm",
+    yscale = log10,
+    title  = "(g) Gradient Norm ||g|| over training")
+
+    add_curves!(ax_g, :batches, :gnorm)
+
+
+    Label(fig[5, :],
         "CIFAR-10 (N_train=$(N_TRAIN), N_test=$(N_TEST), batch=$(BATCH)).  " *
         "Adam and AMSGrad use lr=$(LR); Tadam adapts its step size automatically.\n" *
         "Panels (a–d): three runs per method (seeds 42, 123, 456 recommended). " *
