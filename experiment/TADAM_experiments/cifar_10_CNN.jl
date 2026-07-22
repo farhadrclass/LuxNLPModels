@@ -11,7 +11,7 @@ using Optimisers
 using MLDatasets
 using MLUtils
 using OneHotArrays
-using NNlib: logitcrossentropy
+using NNlib: logsoftmax
 using Random, Statistics, Printf, LinearAlgebra
 using CairoMakie
 import CairoMakie: Axis
@@ -103,8 +103,8 @@ const ps_template = ComponentArray(ps_cpu)
 const ps0_dev     = to_dev(copy(ps_template))     
 const st_dev      = to_dev(st_cpu)                
 
-# Highly optimized fused cross-entropy directly handles logits
-loss_fn(ŷ, y) = mean(logitcrossentropy(ŷ, y; dims=1))
+
+loss_fn(ŷ, y) = mean(-sum(y .* logsoftmax(ŷ; dims=1); dims=1))
 
 # ----------------------------------------------------------------
 # Memory-Safe, GPU-Accelerated Batched Evaluation
