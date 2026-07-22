@@ -51,7 +51,7 @@ const train_y_gpu = to_dev(train_y_cpu)
 const test_x_gpu  = to_dev(test_x_cpu)
 const test_y_gpu  = to_dev(test_y_cpu)
 
-const BATCH = 524
+const BATCH = 256
 
 # ----------------------------------------------------------------
 # GPU-native sampler
