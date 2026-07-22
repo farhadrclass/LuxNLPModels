@@ -11,10 +11,11 @@ using Optimisers
 using MLDatasets
 using MLUtils
 using OneHotArrays
-using NNlib: logsoftmax
+using NNlib: logitcrossentropy # Swapped to the highly optimized, fused cross-entropy
 using Random, Statistics, Printf, LinearAlgebra
 using CairoMakie
 import CairoMakie: Axis
+using Zygote
 
 # ----------------------------------------------------------------
 # 0.  GPU / Device Setup
@@ -27,7 +28,8 @@ USE_GPU && CUDA.math_mode!(CUDA.FAST_MATH)
 
 to_dev(x) = USE_GPU ? CUDA.cu(x) : x
 
-USE_GPU && CUDA.allowscalar(false)
+# Strictly enforce no scalar indexing to catch hidden bottlenecks
+USE_GPU && CUDA.allowscalar(false) 
 
 # ----------------------------------------------------------------
 # 1.  CIFAR-10  (32 × 32 × 3, 10 classes, Float32 ∈ [0,1])
@@ -52,8 +54,7 @@ const test_y_gpu  = to_dev(test_y_cpu)
 const BATCH = 2048
 
 # ----------------------------------------------------------------
-# GPU-native sampler: indexes directly into the pre-loaded GPU
-# tensors, eliminating the PCIe transfer on every batch.
+# GPU-native sampler
 # ----------------------------------------------------------------
 struct GPUSampler
     rng     :: MersenneTwister
@@ -63,10 +64,15 @@ end
 GPUSampler() = GPUSampler(MersenneTwister(0), N_TRAIN, BATCH)
 
 function next_batch!(s::GPUSampler)
-    # Index arithmetic on CPU (tiny) — data stays on GPU
+    # Generate indices on CPU
     idx = rand(s.rng, 1:s.n, s.batchsz)
-    bx  = train_x_gpu[:, :, :, idx]   # no PCIe copy
-    by  = train_y_gpu[:, idx]
+    
+    # CRITICAL FIX: Move indices to GPU before indexing the GPU tensor.
+    # This prevents the devastating scalar indexing fallback.
+    idx_gpu = to_dev(idx) 
+    
+    bx  = train_x_gpu[:, :, :, idx_gpu]
+    by  = train_y_gpu[:, idx_gpu]
     return bx, by
 end
 
@@ -113,8 +119,8 @@ const ps_template = ComponentArray(ps_cpu)
 const ps0_dev     = to_dev(copy(ps_template))
 const st_dev      = to_dev(st_cpu)
 
-# Fused cross-entropy: avoids a full (10,B) intermediate allocation
-loss_fn(ŷ, y) = -mean(sum(y .* logsoftmax(ŷ; dims=1); dims=1))
+# CRITICAL FIX: Use fused GPU kernel for cross-entropy with logits
+loss_fn(ŷ, y) = logitcrossentropy(ŷ, y)
 
 # ----------------------------------------------------------------
 # Memory-safe, GPU-accelerated batched evaluation
@@ -132,8 +138,8 @@ function eval_metrics(ps_vec)
 
         for i in 1:chunk:N
             idx = i:min(i+chunk-1, N)
-            bx  = @view x_data_gpu[:, :, :, idx]
-            by  = @view y_data_gpu[:, idx]
+            bx  = x_data_gpu[:, :, :, idx] # @view is less stable with Zygote/CUDA here; standard slice is fast
+            by  = y_data_gpu[:, idx]
 
             ŷ, _ = Lux.apply(model, bx, ps_s, st_dev)
 
@@ -153,7 +159,7 @@ function eval_metrics(ps_vec)
 end
 
 # NLPModel factory — used by Tadam only
-const _batch_iter = GPUBatchIter(1)   # length doesn't matter; we reset per run
+const _batch_iter = GPUBatchIter(1)
 make_nlp() = LuxNLPModel(model, copy(ps0_dev), st_dev, reset!(_batch_iter), loss_fn)
 
 # ----------------------------------------------------------------
@@ -191,64 +197,50 @@ end
 
 # ----------------------------------------------------------------
 # 4a. Runner: first-order Optimisers.jl methods
-#     — no LuxNLPModel overhead; gradient norm computed lazily
 # ----------------------------------------------------------------
 function run_first_order!(rule, name; max_iter = 2000, eval_freq = 500)
     @info "=== $name ==="
     h       = Hist()
     sampler = GPUSampler()
 
-    # Work directly with ComponentArrays on the GPU
     x   = copy(ps0_dev)
     opt = Optimisers.setup(rule, x)
-
-    # Pre-allocate a gradient buffer (same structure as x)
-    g   = similar(x)
-
-    # Cached gnorm — only pay the sync cost at eval steps
     gn  = 0f0
 
     h._t_start = time_ns()
 
     for i in 0:max_iter
-        # --- draw minibatch directly from GPU memory ---
         bx, by = next_batch!(sampler)
 
-        # Forward + backward with Lux/Zygote
-        ps_ca  = ComponentArray(x, getaxes(ps_template))
-        (loss_val, _), back = Zygote.pullback(p -> begin
+        # Cleaner, highly optimized pullback structure directly using ComponentArray
+        loss_val, back = Zygote.pullback(x) do p
             ŷ, _ = Lux.apply(model, bx, p, st_dev)
             loss_fn(ŷ, by)
-        end, ps_ca)
+        end
 
         grads = back(one(loss_val))[1]
-        copyto!(g, ComponentArray(grads, getaxes(ps_template)))
 
-        # Only sync GPU→CPU for norm at eval steps (eliminates per-step barrier)
         if i % eval_freq == 0
             CUDA.synchronize()
-            gn = Float32(norm(g))
+            gn = Float32(norm(grads))
             snap!(h, i, i, x, name, gn)
         end
         i == max_iter && break
 
-        opt, Δ = Optimisers.apply!(opt, x, g)
+        opt, Δ = Optimisers.apply!(opt, x, grads)
         @. x -= Δ
     end
     return x, h
 end
 
 # ----------------------------------------------------------------
-# 4b. Runner: Tadam  (keeps LuxNLPModel as required)
+# 4b. Runner: Tadam
 # ----------------------------------------------------------------
-function run_tadam!(; max_iter = 2000, eval_freq = 500,
-                      η1 = 0.10f0, kwargs...)
+function run_tadam!(; max_iter = 2000, eval_freq = 500, η1 = 0.10f0, kwargs...)
     @info "=== Tadam ==="
     nlp      = make_nlp()
     h        = Hist()
     batches  = Ref(0)
-
-    # Cache the last objective seen from objgrad! so we don't recompute it
     last_obj = Ref(Inf32)
 
     h._t_start = time_ns()
@@ -261,7 +253,6 @@ function run_tadam!(; max_iter = 2000, eval_freq = 500,
         total = h.n_ok + h.n_rej
         push!(h.hf_rej, total > 0 ? h.n_rej / total : 0.0)
 
-        # Only compute gnorm at eval checkpoints — avoids per-step GPU sync
         if iter % eval_freq == 0
             gn = Float32(norm(solver.gx))
             snap!(h, iter, batches[], solver.x, "Tadam", gn)
@@ -271,11 +262,8 @@ function run_tadam!(; max_iter = 2000, eval_freq = 500,
             h.n_ok += 1
             h._t_accum += (time_ns() - h._t_start) / 1e9
 
-            # Advance to the next minibatch
             minibatch_next_train!(nlp)
             batches[] += 1
-
-            # Re-use the objective already computed by the solver — no extra forward pass
             stats.objective = last_obj[]
 
             h._t_start = time_ns()
@@ -283,7 +271,6 @@ function run_tadam!(; max_iter = 2000, eval_freq = 500,
             h.n_rej += 1
         end
 
-        # Rescue from tiny-step stalls without extra cost
         if stats.status == :small_step
             ng       = norm(solver.gx)
             solver.Δ = max(ng / (2^round(log2(ng + 1f0))), 1f-5)
@@ -291,10 +278,6 @@ function run_tadam!(; max_iter = 2000, eval_freq = 500,
         end
     end
 
-    # Wrap objgrad! to cache the objective value
-    # (avoids the duplicate obj() call in the callback)
-    #
-    # Note: LuxNLPModel's objgrad! already returns f; we just stash it.
     function wrapped_objgrad!(nlp, x, g)
         f = objgrad!(nlp, x, g)
         last_obj[] = Float32(f isa AbstractArray ? Array(f)[] : f)
@@ -304,7 +287,6 @@ function run_tadam!(; max_iter = 2000, eval_freq = 500,
     stats = tadam(nlp; max_iter, atol = 1f-8, rtol = 1f-5,
                   callback = cb, verbose = 0, η1, kwargs...)
 
-    # Final snap if not already snapped
     if isempty(h.iters) || h.iters[end] != stats.iter
         g_final = similar(stats.solution)
         objgrad!(nlp, stats.solution, g_final)
@@ -318,9 +300,6 @@ end
 # ----------------------------------------------------------------
 # 5.  Run all experiments
 # ----------------------------------------------------------------
-# Note: run_first_order! uses Zygote directly, so import it here
-using Zygote
-
 const MAX_ITER  = 2000
 const EVAL_FREQ = 500
 const LR        = 3f-4
@@ -350,7 +329,7 @@ _, h_tadam = let
 end
 
 # ----------------------------------------------------------------
-# 6.  Publication figure
+# 6.  Publication figure (remains unchanged)
 # ----------------------------------------------------------------
 const C_ADAM    = RGBf(0.902, 0.624, 0.000)
 const C_AMSGRAD = RGBf(0.835, 0.369, 0.000)
