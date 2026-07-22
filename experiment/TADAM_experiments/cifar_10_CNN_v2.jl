@@ -5,7 +5,8 @@
 #   - GPU-first (CUDA/LuxCUDA); falls back to CPU if CUDA unavailable.
 #   - Small VGG-like CNN: 3 → 32 → 32 → 64 → 64, 2× MaxPool.
 #   - Full CIFAR-10: 50 000 train / 10 000 test (toggle subset below).
-#   - Batched evaluation on GPU to avoid OOM.
+#   - GPU-sized mini-batches and bounded evaluation work.
+#   - Elapsed time includes metric evaluation and device synchronization.
 #
 # Recommended environment: lux_test_env_4  (has Lux, LuxCUDA, Optimisers,
 # JSOSolvers, CairoMakie, MLDatasets, etc.).
@@ -25,6 +26,7 @@ using MLUtils
 using OneHotArrays
 using NNlib: logsoftmax
 using Random, Statistics, Printf, LinearAlgebra
+using Zygote
 using CairoMakie
 import CairoMakie: Axis
 
@@ -43,8 +45,22 @@ end
 # 1.  CIFAR-10  (32 × 32, RGB, 10 classes)
 # ----------------------------------------------------------------
 @info "Loading CIFAR-10..."
-tr_x_raw, tr_y_raw = CIFAR10.traindata(Float32)   # → (32, 32, 3, 50_000)
-te_x_raw, te_y_raw = CIFAR10.testdata(Float32)    # → (32, 32, 3, 10_000)
+tr_x_raw, tr_y_raw = CIFAR10(split = :train)[:]   # → (32, 32, 3, 50_000)
+te_x_raw, te_y_raw = CIFAR10(split = :test)[:]    # → (32, 32, 3, 10_000)
+
+# Normalization is explicit because MLDatasets versions can expose stored
+# CIFAR pixels either as 0:255 values or as already scaled Float32 values.
+const CIFAR_MEAN = reshape(Float32[0.4914, 0.4822, 0.4465], 1, 1, 3, 1)
+const CIFAR_STD  = reshape(Float32[0.2470, 0.2435, 0.2616], 1, 1, 3, 1)
+function normalize_cifar10(images)
+    normalized = Float32.(images)
+    maximum(normalized) > 1f0 && (normalized ./= 255f0)
+    normalized .-= CIFAR_MEAN
+    normalized ./= CIFAR_STD
+    return normalized
+end
+tr_x_raw = normalize_cifar10(tr_x_raw)
+te_x_raw = normalize_cifar10(te_x_raw)
 
 # Toggle for quick CPU/GPU smoke tests.
 const USE_SUBSET = false
@@ -61,15 +77,22 @@ train_y = Float32.(onehotbatch(tr_y_raw[1:N_TRAIN], 0:9)) |> dev
 test_x  = te_x_raw[:, :, :, 1:N_TEST]  |> dev
 test_y  = Float32.(onehotbatch(te_y_raw[1:N_TEST],  0:9)) |> dev
 
-const BATCH = 128
-const EVAL_BATCH = 1_000   # used only during full-dataset metric evaluation
+# A 128-image batch underutilizes large data-center GPUs.  1024 is a safe
+# starting point for this compact CNN on an 89 GB accelerator; reduce it only
+# if your specific GPU reports an out-of-memory error.
+const BATCH = 1_024
+const EVAL_BATCH = 2_048
 
-# For reproducible shuffling across the three independent runs.
-const DL_RNG = MersenneTwister(123)
+# Each snapshot evaluates a representative, fixed training prefix and the full
+# test set.  Evaluating all 50k training images every few updates dominates the
+# wall time while adding little information to a convergence comparison.
+const METRIC_TRAIN_SAMPLES = USE_SUBSET ? N_TRAIN : 10_000
 
-data_loader = DataLoader(
+# Each method receives the same shuffled mini-batch sequence.  A fresh loader
+# is required because DataLoader advances the supplied RNG while iterating.
+make_data_loader() = DataLoader(
     (train_x, train_y);
-    batchsize = BATCH, shuffle = true, rng = DL_RNG,
+    batchsize = BATCH, shuffle = true, rng = MersenneTwister(123),
 )
 
 # ----------------------------------------------------------------
@@ -114,12 +137,11 @@ function acc(ŷ, y)
     return mean(pred .== true_lbl)
 end
 
-# Evaluate on fixed train/test splits in batched GPU passes.
+# Evaluate a fixed training prefix and the full test split in batched GPU passes.
 function eval_metrics(ps_vec)
-    ps_s = ComponentArray(Array(ps_vec), getaxes(ps_template)) |> dev
+    ps_s = ComponentArray(Array(getdata(ps_vec)), getaxes(ps_template)) |> dev
 
-    function eval_split(x, y)
-        n = size(x, 4)
+    function eval_split(x, y, n)
         total_loss = 0.0f0
         total      = 0
         correct    = 0
@@ -138,15 +160,31 @@ function eval_metrics(ps_vec)
         return Float32(avg_loss), Float32(avg_acc)
     end
 
-    tr_loss, tr_acc = eval_split(train_x, train_y)
-    te_loss, te_acc = eval_split(test_x,  test_y)
+    tr_loss, tr_acc = eval_split(train_x, train_y, METRIC_TRAIN_SAMPLES)
+    te_loss, te_acc = eval_split(test_x,  test_y, N_TEST)
     return tr_loss, tr_acc, te_acc
 end
 
-make_nlp() = LuxNLPModel(model, copy(ps0), st, data_loader, loss_fn; dev)
+make_nlp() = LuxNLPModel(model, copy(ps0), st, make_data_loader(), loss_fn; dev)
 
 @printf "Total parameters: %d\n" length(ps0)
-@printf "Initial train batch loss: %.4f\n\n" obj(make_nlp(), ps0)
+initial_nlp = make_nlp()
+CUDA.functional() && @assert initial_nlp.meta.x0 isa CuArray "GPU solver vector was not created on CUDA"
+@printf "Initial train batch loss: %.4f\n\n" obj(initial_nlp, initial_nlp.meta.x0)
+
+# Compile the native GPU Adam forward/backward/update paths before timing any
+# method. Each actual run below starts from a separate, unchanged copy of ps0.
+warmup_nlp = make_nlp()
+warmup_ps = ComponentArray(ps0) |> dev
+warmup_x, warmup_y = warmup_nlp.current_batch
+warmup_val, warmup_back = Zygote.pullback(warmup_ps) do p
+    ŷ, _ = Lux.apply(model, warmup_x, p, st)
+    loss_fn(ŷ, warmup_y)
+end
+warmup_g = warmup_back(one(Float32))[1]
+warmup_opt = Optimisers.setup(Optimisers.Adam(1f-3), warmup_ps)
+warmup_opt, warmup_ps = Optimisers.update(warmup_opt, warmup_ps, warmup_g)
+CUDA.functional() && CUDA.synchronize()
 
 # ----------------------------------------------------------------
 # 3.  History struct
@@ -165,7 +203,7 @@ mutable struct Hist
     hf_rej   :: Vector{Float64}   # running rejection rate
     n_ok     :: Int
     n_rej    :: Int
-    # Internal timer (eval time is excluded from wall-clock)
+    # Elapsed wall-clock timer, including evaluation and GPU synchronization
     _t_accum :: Float64
     _t_start :: UInt64
 end
@@ -176,42 +214,47 @@ Hist() = Hist(
 )
 
 function snap!(h::Hist, iter, batches, ps_vec, tag)
-    h._t_accum += (time_ns() - h._t_start) / 1e9
     tr_loss, tr_acc, te_acc = eval_metrics(ps_vec)
+    CUDA.functional() && CUDA.synchronize()
+    h._t_accum = (time_ns() - h._t_start) / 1e9
     push!(h.iters,   iter);    push!(h.batches, batches)
     push!(h.times,   h._t_accum)
     push!(h.tr_loss, tr_loss); push!(h.tr_acc, tr_acc); push!(h.te_acc, te_acc)
     @printf "[%s] iter=%4d  bat=%4d  t=%5.1fs  loss=%.4f  tr=%.1f%%  te=%.1f%%\n"  tag iter batches h._t_accum tr_loss (100tr_acc) (100te_acc)
-    h._t_start = time_ns()
 end
 
 # ----------------------------------------------------------------
-# 4a.  Runner: first-order optimisers (Adam, AMSGrad)
+# 4a.  Runner: native GPU first-order optimisers (Adam, AMSGrad)
+#
+# Tadam uses LuxNLPModel and therefore has CPU-resident solver vectors.
+# Adam/AMSGrad do not need that interface: keeping their parameters, gradients,
+# and Optimisers state on `dev` avoids a full CPU↔GPU transfer every update.
 # ----------------------------------------------------------------
-function run_first_order!(rule, name; max_iter = 3000, eval_freq = 50)
+function run_first_order_gpu!(rule, name; max_iter = 3000, eval_freq = 50)
     @info "=== $name ==="
     nlp     = make_nlp()
-    x       = copy(nlp.meta.x0)
-    g       = similar(x)
+    ps      = ComponentArray(ps0) |> dev
     h       = Hist()
     batches = 0
-    opt     = Optimisers.setup(rule, x)
+    opt     = Optimisers.setup(rule, ps)
     h._t_start = time_ns()
 
     for i in 0:max_iter
-        i % eval_freq == 0 && snap!(h, i, batches, x, name)
+        i % eval_freq == 0 && snap!(h, i, batches, ps, name)
         i == max_iter && break
-        f, _ = objgrad!(nlp, x, g)
-        # Stop early if loss becomes non-finite (useful on unstable runs).
-        if !isfinite(f)
-            @warn "$name encountered non-finite loss at iter $i; stopping early."
-            break
+
+        x_batch, y_batch = nlp.current_batch
+        _, back = Zygote.pullback(ps) do p
+            ŷ, _ = Lux.apply(model, x_batch, p, st)
+            loss_fn(ŷ, y_batch)
         end
-        opt, x = Optimisers.update(opt, x, g)
+        g = back(one(Float32))[1]
+        isnothing(g) && error("$name produced no parameter gradient")
+        opt, ps = Optimisers.update(opt, ps, g)
         minibatch_next_train!(nlp)
         batches += 1
     end
-    return x, h
+    return ps, h
 end
 
 # ----------------------------------------------------------------
@@ -239,11 +282,9 @@ function run_tadam!(; max_iter = 3000, eval_freq = 50, η1 = 0.10f0, kwargs...)
         # Step acceptance / batch advance.
         if solver.step_accepted
             h.n_ok += 1
-            h._t_accum += (time_ns() - h._t_start) / 1e9
             minibatch_next_train!(nlp)
             batches[] += 1
             stats.objective = obj(nlp, solver.x)
-            h._t_start = time_ns()
         elseif iter > 0
             h.n_rej += 1
         end
@@ -275,14 +316,14 @@ end
 # 5.  Run all three methods
 # ----------------------------------------------------------------
 const MAX_ITER  = 3_000
-const EVAL_FREQ = 50
+const EVAL_FREQ = 250
 const LR        = 1f-3
 
-_, h_adam    = run_first_order!(
+_, h_adam    = run_first_order_gpu!(
     Optimisers.Adam(LR),    "Adam";
     max_iter = MAX_ITER, eval_freq = EVAL_FREQ,
 )
-_, h_amsgrad = run_first_order!(
+_, h_amsgrad = run_first_order_gpu!(
     Optimisers.AMSGrad(LR), "AMSGrad";
     max_iter = MAX_ITER, eval_freq = EVAL_FREQ,
 )
@@ -388,7 +429,7 @@ with_theme(pub_theme) do
            color = C_TADAM, linewidth = 2.0)
 
     Label(fig[4, :],
-        "CIFAR-10  (N_train=$(N_TRAIN), N_test=$(N_TEST), batch=$(BATCH)).  " *
+        "CIFAR-10  (N_train=$(N_TRAIN), N_test=$(N_TEST), batch=$(BATCH), metric train=$(METRIC_TRAIN_SAMPLES)).  " *
         "CNN: Conv 3→32→32→64→64, MaxPool×2, 4096→512→10.  Adam & AMSGrad use lr=$(LR); " *
         "Tadam adapts Δ automatically.\n" *
         "Panels (e–f): Tadam internal diagnostics showing self-tuning behaviour.",

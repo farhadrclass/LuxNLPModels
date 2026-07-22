@@ -3,9 +3,8 @@
 # Type tag kept for potential user-side ForwardDiff extensions.
 struct LuxNLPModelTag end
 
-# V is always a plain CPU vector (Vector{T}).  JSOSolvers allocates all its
-# internal state from meta.x0, so keeping V on CPU is required for solver
-# compatibility regardless of where the model and data live.
+# V is allocated on `dev`.  Solver implementations that support device arrays
+# therefore retain their parameters, gradients, and work vectors on the GPU.
 mutable struct LuxNLPModel{T, V <: AbstractVector{T}, M, S, D, I, B, L, AX} <: AbstractNLPModel{T, V}
     meta::NLPModelMeta{T, V}
     counters::Counters
@@ -19,8 +18,8 @@ mutable struct LuxNLPModel{T, V <: AbstractVector{T}, M, S, D, I, B, L, AX} <: A
     axes::AX          # ComponentArray structural axes (CPU metadata, no data)
     dev::Any          # Lux device: cpu_device() or gpu_device()
 
-    g_cache::V        # scratch buffer for gradient (always CPU)
-    hv_cache::V       # scratch buffer for Hv finite difference (always CPU)
+    g_cache::V        # scratch buffer for gradient, allocated on `dev`
+    hv_cache::V       # scratch buffer for Hv finite difference, allocated on `dev`
 end
 
 """
@@ -31,7 +30,7 @@ Wrap a Lux model as an `NLPModels.AbstractNLPModel`.
 # Arguments
 - `model`       : a Lux `AbstractLuxLayer`.
 - `ps`          : a `ComponentVector{T}` of model parameters.  May already live
-                  on the target device; `x0` will always be copied to CPU.
+                  on the target device; `x0` is copied to `dev`.
 - `st`          : Lux model state returned by `Lux.setup`.  Should already be
                   moved to `dev` by the caller.
 - `data_loader` : any iterable that yields `(X_batch, y_batch)` pairs.
@@ -41,9 +40,10 @@ Wrap a Lux model as an `NLPModels.AbstractNLPModel`.
                   Defaults to `cpu_device()`.
 
 # Notes
-- `meta.x0` (and all solver-side vectors) are always `Vector{T}` on CPU.
-- Inside `obj`/`grad!` the flat parameter vector `x` is transferred to `dev`
-  on every call.  Use `objgrad!` to halve the number of AD passes.
+- `meta.x0` (and solver-side vectors allocated from it) live on `dev`.  The
+    solver must therefore support the chosen array type, such as `CuArray`.
+- `obj`/`grad!` expect `x` and `g` to live on `dev`; `objgrad!` computes both
+    in one reverse-mode pass.
 - Stateful layers (BatchNorm, Dropout) require the caller to manage `nlp.st`
   between epochs; the state returned by `Lux.apply` is intentionally discarded
   inside `obj`/`grad!` to keep the solver-facing interface side-effect-free.
@@ -52,20 +52,20 @@ function LuxNLPModel(
     model, ps::ComponentVector{T}, st, data_loader, loss_fn;
     dev = cpu_device(),
 ) where T
-    # Always copy parameter data to a plain CPU Vector so that NLPModelMeta
-    # (and every JSOSolvers internal buffer) stays on CPU.
-    flat_ps_cpu = Array(getdata(ps))   # Array() is a no-op for CPU, copies for GPU
-    axes = getaxes(ps)
-    n    = length(flat_ps_cpu)
+    # Solver state is allocated from x0, so its device determines where the
+    # complete optimization state lives.  `copy` prevents aliasing caller ps.
+    flat_ps = copy(dev(getdata(ps)))
+    axes    = getaxes(ps)
+    n       = length(flat_ps)
 
-    meta = NLPModelMeta(n; x0 = flat_ps_cpu, name = "LuxNLPModel")
+    meta = NLPModelMeta(n; x0 = flat_ps, name = "LuxNLPModel")
 
     iter = iterate(data_loader)
     iter === nothing && error("DataLoader is empty")
     current_batch, iter_state = iter
 
-    g_cache  = similar(flat_ps_cpu)
-    hv_cache = similar(flat_ps_cpu)
+    g_cache  = similar(flat_ps)
+    hv_cache = similar(flat_ps)
 
     return LuxNLPModel(
         meta, Counters(),

@@ -34,7 +34,7 @@ make_nlp() = LuxNLPModel(model, ps_cv, st, loader, loss_fn)
 
         @test nlp.meta.nvar == length(ps_cv)
 
-        # x0 must always be a plain CPU Vector, regardless of device
+        # On the CPU device, x0 is a CPU vector. GPU tests use a CuArray x0.
         @test nlp.meta.x0 isa Vector{Float32}
         @test length(nlp.meta.x0) == length(ps_cv)
 

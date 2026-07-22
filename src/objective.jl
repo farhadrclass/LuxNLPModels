@@ -11,9 +11,9 @@ function _compute_grad!(
     x   :: AbstractVector{T},
     g   :: AbstractVector{T},
 ) where T
-    # Transfer the flat CPU parameter vector to the target device and give it
-    # the ComponentArray layout the model expects.
-    cx = ComponentVector(x, nlp.axes) |> nlp.dev
+    # Solver vectors already live on nlp.dev; adding ComponentArray metadata
+    # does not move their backing storage.
+    cx = ComponentVector(x, nlp.axes)
     X_batch, y_batch = nlp.current_batch
 
     # Zygote differentiates w.r.t. cx.  The result is a ComponentVector that
@@ -26,8 +26,7 @@ function _compute_grad!(
     if isnothing(g_val)
         fill!(g, zero(T))
     else
-        # Move gradient back to CPU (where the solver lives).
-        g .= cpu_device()(getdata(g_val))
+        g .= getdata(g_val)
     end
     return g
 end
@@ -38,7 +37,7 @@ end
 
 function obj(nlp::LuxNLPModel{T}, x::AbstractVector{T}) where T
     NLPModels.increment!(nlp, :neval_obj)
-    cx = ComponentVector(x, nlp.axes) |> nlp.dev
+    cx = ComponentVector(x, nlp.axes)
     X_batch, y_batch = nlp.current_batch
     y_pred, _ = Lux.apply(nlp.model, X_batch, cx, nlp.st)
     return T(nlp.loss_fn(y_pred, y_batch))
@@ -59,7 +58,7 @@ and `grad!` separately and is the hot path used by most JSOSolvers routines.
 function objgrad!(nlp::LuxNLPModel{T}, x::AbstractVector{T}, g::AbstractVector{T}) where T
     NLPModels.increment!(nlp, :neval_obj)
     NLPModels.increment!(nlp, :neval_grad)
-    cx = ComponentVector(x, nlp.axes) |> nlp.dev
+    cx = ComponentVector(x, nlp.axes)
     X_batch, y_batch = nlp.current_batch
 
     # pullback returns (forward_value, backward_closure).
@@ -74,7 +73,7 @@ function objgrad!(nlp::LuxNLPModel{T}, x::AbstractVector{T}, g::AbstractVector{T
     if isnothing(g_val)
         fill!(g, zero(T))
     else
-        g .= cpu_device()(getdata(g_val))
+        g .= getdata(g_val)
     end
     return T(val), g
 end
