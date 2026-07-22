@@ -46,9 +46,16 @@ train_y_cpu = onehotbatch(tr_y_raw[1:N_TRAIN], 0:9)
 test_x_cpu  = te_x_raw[:, :, :, 1:N_TEST]
 test_y_cpu  = onehotbatch(te_y_raw[1:N_TEST], 0:9)
 
+# Push everything to the GPU permanently right now
+const train_x_gpu = to_dev(train_x_cpu)
+const train_y_gpu = to_dev(train_y_cpu)
+const test_x_gpu  = to_dev(test_x_cpu)
+const test_y_gpu  = to_dev(test_y_cpu)
+
 const BATCH = 256
+# Point the DataLoader directly at the GPU arrays
 data_loader = DataLoader(
-    (to_dev(train_x_cpu), to_dev(train_y_cpu));
+    (train_x_gpu, train_y_gpu);
     batchsize = BATCH, shuffle = true,
 )
 
@@ -84,28 +91,27 @@ loss_fn(ŷ, y) = mean(-sum(y .* logsoftmax(ŷ; dims=1); dims=1))
 
 # GPU-accelerated and memory-safe batched evaluation
 function eval_metrics(ps_vec)
-    # Keep parameters directly on the GPU! (No Array() copy needed)
-    # ps_s = ComponentArray(ps_vec, getaxes(ps_template))
+    # Push the solver's current variables to the GPU safely
     ps_s = ComponentArray(to_dev(ps_vec), getaxes(ps_template))
     
-    function batched_eval(x_data_cpu, y_data_cpu)
-        N = size(x_data_cpu, 4)
-        chunk = 1000 # Send 1000 images at a time to maximize GPU efficiency safely
+    function batched_eval(x_data_gpu, y_data_gpu)
+        N = size(x_data_gpu, 4)
+        chunk = 1000 
         tot_loss = 0f0
         tot_correct = 0
         
         for i in 1:chunk:N
             idx = i:min(i+chunk-1, N)
             
-            # Push only the current chunk to the GPU
-            bx = to_dev(x_data_cpu[:, :, :, idx])
-            by = to_dev(y_data_cpu[:, idx])
+            # Slicing happens directly on the GPU! No PCIe transfer overhead.
+            bx = x_data_gpu[:, :, :, idx]
+            by = y_data_gpu[:, idx]
             
             # Forward pass on the GPU
             ŷ, _ = Lux.apply(model, bx, ps_s, st_dev)
             
-            # Accumulate loss
-            tot_loss += Float32(loss_fn(ŷ, by)) * length(idx)
+            # 🚀 NEW: Safely extract loss without scalar indexing stalls
+            tot_loss += Float32(Array(loss_fn(ŷ, by))[]) * length(idx)
             
             # Pull ONLY lightweight predictions back to CPU to compute accuracy
             ŷ_cpu = Array(ŷ)
@@ -115,12 +121,11 @@ function eval_metrics(ps_vec)
         return tot_loss / N, Float32(tot_correct) / N
     end
 
-    tr_loss, tr_acc = batched_eval(train_x_cpu, train_y_cpu)
-    _, te_acc = batched_eval(test_x_cpu, test_y_cpu)
+    tr_loss, tr_acc = batched_eval(train_x_gpu, train_y_gpu)
+    _, te_acc = batched_eval(test_x_gpu, test_y_gpu)
     
     return Float32(tr_loss), Float32(tr_acc), Float32(te_acc)
 end
-
 make_nlp() = LuxNLPModel(model, copy(ps0_dev), st_dev, data_loader, loss_fn)
 
 # ----------------------------------------------------------------
@@ -163,7 +168,7 @@ end
 function run_first_order!(rule, name; max_iter = 2000, eval_freq = 50)
     @info "=== $name ==="
     nlp     = make_nlp()
-    x       = copy(nlp.meta.x0)
+    x       = to_dev(copy(nlp.meta.x0))
     g       = similar(x)
     h       = Hist()
     batches = 0
@@ -173,8 +178,13 @@ function run_first_order!(rule, name; max_iter = 2000, eval_freq = 50)
     for i in 0:max_iter
         i % eval_freq == 0 && snap!(h, i, batches, x, name)
         i == max_iter && break
+        
         objgrad!(nlp, x, g)
-        opt, x = Optimisers.update(opt, x, g)
+        
+        #  IN-PLACE update keeps the ComponentArray structure intact on the GPU!
+        opt, g_opt = Optimisers.apply!(opt, x, g)
+        @. x -= g_opt
+        
         minibatch_next_train!(nlp)
         batches += 1
     end
